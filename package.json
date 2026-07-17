@@ -1,0 +1,23 @@
+{
+  "name": "ncgas",
+  "version": "0.1.0",
+  "private": true,
+  "description": "NCGAS — No-Code Google Apps Script Framework: Vue 3 visual builder that compiles blueprints into GAS web apps",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "build:gas": "vite build --mode gas && node scripts/sync-gas.mjs",
+    "sync:gas": "node scripts/sync-gas.mjs",
+    "test": "node --test tests/expression-engine.test.mjs tests/blueprint-utils.test.mjs",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "vue": "^3.5.13"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^5.2.1",
+    "vite": "^6.0.7",
+    "vite-plugin-singlefile": "^2.1.0"
+  }
+}

@@ -1,0 +1,76 @@
+<!doctype html>
+<html>
+<head>
+  <base target="_top">
+  <meta charset="utf-8">
+  <style>
+/*__NCGAS_BASE_CSS__*/
+  </style>
+</head>
+<body>
+  <div id="app" class="nc-app" style="display:grid;place-items:center;min-height:100vh;color:#9aa3b8;font-family:sans-serif">
+    Memuat aplikasi…
+  </div>
+
+  <!-- Vue 3 runtime (global build). For fully-offline domains, mirror this file
+       internally and point the URL at your mirror before compiling. -->
+  <script src="https://cdn.jsdelivr.net/npm/vue@3.5.13/dist/vue.global.prod.js"></script>
+
+  <script>
+/*__NCGAS_EXPRESSION_ENGINE__*/
+  </script>
+  <script>
+/*__NCGAS_RUNTIME_CORE__*/
+  </script>
+
+  <script>
+    // Injected per-request by doGet (RBAC-filtered blueprint + identity)
+    window.__NCGAS_BLUEPRINT__ = <?!= bootBlueprintJs ?>;
+    window.__NCGAS_IDENTITY__ = <?!= bootIdentityJs ?>;
+  </script>
+
+  <script>
+    (function () {
+      'use strict';
+      function fatal(message) {
+        document.getElementById('app').innerHTML =
+          '<div style="max-width:520px;padding:24px;border:1px solid #e5534b;border-radius:12px;color:#ff8a84;font-family:sans-serif">' +
+          '<b>Aplikasi gagal dimuat</b><br>' + message.replace(/</g, '&lt;') + '</div>';
+      }
+      if (typeof Vue === 'undefined') return fatal('Vue CDN tidak dapat diakses dari jaringan Anda. Hubungi admin untuk menggunakan mirror internal.');
+      if (!window.NCGASExpression || !window.NCGASRuntime) return fatal('Runtime NCGAS tidak lengkap — recompile aplikasi dari builder.');
+
+      var rpc = function (action, payload) {
+        return new Promise(function (resolve, reject) {
+          google.script.run
+            .withSuccessHandler(function (envelopeJson) {
+              var envelope;
+              try { envelope = JSON.parse(envelopeJson); }
+              catch (e) { return reject(new Error('Respons server tidak valid')); }
+              if (envelope.ok) return resolve(envelope.data);
+              var err = new Error(envelope.error.message);
+              err.code = envelope.error.code;
+              reject(err);
+            })
+            .withFailureHandler(function (err) {
+              reject(new Error((err && err.message) || 'Koneksi ke server GAS gagal'));
+            })
+            .rpcApi(JSON.stringify({ action: action, payload: payload }));
+        });
+      };
+
+      try {
+        var runtime = window.NCGASRuntime.createNCGASRuntime(Vue, window.NCGASExpression);
+        runtime.mountApp({
+          blueprint: window.__NCGAS_BLUEPRINT__,
+          user: window.__NCGAS_IDENTITY__,
+          rpc: rpc,
+          mount: '#app'
+        });
+      } catch (e) {
+        fatal(e.message);
+      }
+    })();
+  </script>
+</body>
+</html>

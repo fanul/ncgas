@@ -1,0 +1,349 @@
+/**
+ * NCGAS Target Runtime Server (generated — do not edit; edit CustomHandlers.gs instead)
+ * Compiled by NCGAS Builder. The blueprint below is DATA; behavior lives in
+ * this audited runtime + ExpressionEngine.gs.
+ */
+
+var NCGAS_BLUEPRINT = "__NCGAS_BLUEPRINT_JSON__";
+
+// ------------------------------------------------------------------ web app --
+
+function doGet(e) {
+  var identity = NcIdentity_();
+  var settings = NCGAS_BLUEPRINT.meta.globalSettings;
+
+  if (settings.authStrategy !== 'PUBLIC' && !identity.email) {
+    return HtmlService.createHtmlOutput(
+      '<h2 style="font-family:sans-serif">403 — ' + NcEscapeHtml_(NCGAS_BLUEPRINT.meta.name) + '</h2>' +
+      '<p style="font-family:sans-serif">Halaman ini memerlukan login akun Google Workspace domain Anda.</p>'
+    );
+  }
+
+  var tpl = HtmlService.createTemplateFromFile('Index');
+  tpl.bootBlueprintJs = NcJsEmbed_(JSON.stringify(NcFilterBlueprintFor_(identity)));
+  tpl.bootIdentityJs = NcJsEmbed_(JSON.stringify(identity));
+  return tpl.evaluate()
+    .setTitle(NCGAS_BLUEPRINT.meta.name)
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1');
+}
+
+/** Run once from the script editor after the first deploy to grant scopes. */
+function authorizeOnce() {
+  SpreadsheetApp.getActiveSpreadsheet; // touch services so consent covers them
+  Session.getActiveUser().getEmail();
+  DriveApp.getRootFolder();
+  GmailApp.getAliases();
+  return 'Authorized as ' + Session.getEffectiveUser().getEmail();
+}
+
+// ----------------------------------------------------------------- identity --
+
+function NcIdentity_() {
+  var email = '';
+  try { email = Session.getActiveUser().getEmail(); } catch (err) { /* anonymous */ }
+  return { email: email, roles: NcResolveRoles_(email) };
+}
+
+function NcResolveRoles_(email) {
+  var rbac = NCGAS_BLUEPRINT.rbac || {};
+  var map = rbac.roleMap || {};
+  if (email && Object.prototype.hasOwnProperty.call(map, email)) return map[email].slice();
+  if (Object.prototype.hasOwnProperty.call(map, '*')) return map['*'].slice();
+  return [];
+}
+
+function NcHasAnyRole_(identity, roles) {
+  if (!roles || !roles.length) return true; // empty list = every authenticated user
+  for (var i = 0; i < roles.length; i++) {
+    if (identity.roles.indexOf(roles[i]) !== -1) return true;
+  }
+  return false;
+}
+
+/**
+ * SERVER-SIDE page RBAC: pages the user may not access are stripped from the
+ * blueprint before it ever reaches the browser. Client-side visibility rules
+ * are UX; this is the real boundary (services re-check on every call anyway).
+ */
+function NcFilterBlueprintFor_(identity) {
+  var bp = JSON.parse(JSON.stringify(NCGAS_BLUEPRINT));
+  Object.keys(bp.pages).forEach(function (pageId) {
+    var allowed = bp.pages[pageId].settings.allowedRoles || [];
+    if (allowed.length && !NcHasAnyRole_(identity, allowed)) delete bp.pages[pageId];
+  });
+  if (!bp.pages[bp.meta.globalSettings.homePage]) {
+    bp.meta.globalSettings.homePage = Object.keys(bp.pages)[0] || null;
+  }
+  delete bp.rbac.roleMap; // don't leak the org's email->role directory to clients
+  return bp;
+}
+
+// --------------------------------------------------------------------- RPC --
+
+/** Single client entry: google.script.run.rpcApi(actionJson) -> envelope JSON. */
+function rpcApi(requestJson) {
+  var identity = NcIdentity_();
+  var request;
+  try { request = JSON.parse(requestJson); }
+  catch (e) { return NcFail_('BAD_PAYLOAD', 'Request is not valid JSON'); }
+
+  if (NCGAS_BLUEPRINT.meta.globalSettings.authStrategy !== 'PUBLIC' && !identity.email) {
+    return NcFail_('UNAUTHENTICATED', 'Sesi login tidak ditemukan.');
+  }
+  if (request.action !== 'runService') {
+    return NcFail_('UNKNOWN_ACTION', 'rpcApi hanya mendukung `runService`.');
+  }
+
+  try {
+    return NcOk_(NcRunService_(identity, request.payload || {}));
+  } catch (e) {
+    var code = e.ncCode || 'SERVER_ERROR';
+    console.error('[rpcApi] ' + code + ': ' + e.message);
+    return NcFail_(code, e.message, e.ncDetails);
+  }
+}
+
+function NcRunService_(identity, payload) {
+  var serviceId = payload.serviceId;
+  var inputs = payload.inputs || {};
+  var service = (NCGAS_BLUEPRINT.sharedServices || {})[serviceId];
+  if (!service) throw NcErr_('SERVICE_NOT_FOUND', 'Service `' + serviceId + '` tidak terdaftar di blueprint.');
+
+  // 1. RBAC gate — the 403 wall
+  if (!NcHasAnyRole_(identity, service.allowedRoles)) {
+    throw NcErr_('FORBIDDEN', '403 Forbidden: role Anda (' + (identity.roles.join(', ') || 'tanpa role') +
+      ') tidak diizinkan menjalankan ' + serviceId + '.');
+  }
+
+  // 2. Execution rules — same expression engine as the client, evaluated here
+  var rules = (service.rules && service.rules.execution) || [];
+  for (var i = 0; i < rules.length; i++) {
+    var passed;
+    try {
+      passed = !!NCGASExpression.evaluate(rules[i].condition, { payload: inputs, user: identity, env: { serviceId: serviceId } });
+    } catch (e) {
+      throw NcErr_('RULE_ERROR', 'Rule server gagal dievaluasi (' + rules[i].condition + '): ' + e.message);
+    }
+    if (!passed) throw NcErr_('RULE_BLOCKED', rules[i].errorMessage || 'Ditolak oleh aturan server.');
+  }
+
+  // 3. dispatch
+  switch (service.type) {
+    case 'SHEET_READ': return NcSheetRead_(identity, service);
+    case 'SHEET_APPEND': return NcSheetAppend_(identity, service, inputs);
+    case 'REPORT_EXPORT': return NcReportExport_(identity, service, inputs);
+    case 'EMAIL_SEND': return NcEmailSend_(identity, service, inputs);
+    case 'GAS_RPC': return NcCustomRpc_(identity, service, inputs);
+    default: throw NcErr_('UNSUPPORTED_TYPE', 'Tipe service `' + service.type + '` tidak dikenali runtime ini.');
+  }
+}
+
+// ------------------------------------------------------------ data services --
+
+function NcOpenSheet_(service) {
+  if (!service.spreadsheetId || service.spreadsheetId.indexOf('PASTE_') === 0) {
+    throw NcErr_('CONFIG', 'spreadsheetId belum diisi pada definisi service.');
+  }
+  var ss;
+  try { ss = SpreadsheetApp.openById(service.spreadsheetId); }
+  catch (e) { throw NcErr_('SHEET_ACCESS', 'Spreadsheet tidak dapat dibuka (' + service.spreadsheetId + '): ' + e.message); }
+  var sheet = service.sheet ? ss.getSheetByName(service.sheet) : ss.getSheets()[0];
+  if (!sheet) throw NcErr_('SHEET_ACCESS', 'Sheet `' + service.sheet + '` tidak ada di spreadsheet.');
+  return sheet;
+}
+
+/**
+ * Data Boundary Isolation: when service.dataBoundary.ownerColumn is set, rows
+ * are filtered to the caller's email. Roles in dataBoundary.bypassRoles
+ * (default ['Admin']) see everything.
+ */
+function NcBoundaryActive_(identity, service) {
+  var boundary = service.dataBoundary;
+  if (!boundary || !boundary.ownerColumn) return null;
+  var bypass = boundary.bypassRoles || ['Admin'];
+  return NcHasAnyRole_(identity, bypass) ? null : boundary;
+}
+
+function NcSheetRead_(identity, service) {
+  var sheet = NcOpenSheet_(service);
+  var values = sheet.getDataRange().getValues();
+  if (values.length < 1) return [];
+  var headers = values[0].map(String);
+  var boundary = NcBoundaryActive_(identity, service);
+  var ownerIdx = boundary ? headers.indexOf(boundary.ownerColumn) : -1;
+  if (boundary && ownerIdx === -1) {
+    throw NcErr_('BOUNDARY_CONFIG', 'Kolom boundary `' + boundary.ownerColumn + '` tidak ditemukan di header sheet — akses ditolak (fail closed).');
+  }
+  var rows = [];
+  for (var r = 1; r < values.length; r++) {
+    if (boundary && String(values[r][ownerIdx]).toLowerCase() !== identity.email.toLowerCase()) continue;
+    var obj = {};
+    for (var c = 0; c < headers.length; c++) obj[headers[c]] = values[r][c];
+    rows.push(obj);
+  }
+  var max = service.maxRows || 2000;
+  return rows.slice(0, max);
+}
+
+function NcSheetAppend_(identity, service, inputs) {
+  var sheet = NcOpenSheet_(service);
+  var lastCol = Math.max(1, sheet.getLastColumn());
+  var headers = sheet.getRange(1, 1, 1, lastCol).getValues()[0].map(String);
+  if (!headers.filter(Boolean).length) {
+    throw NcErr_('SHEET_SCHEMA', 'Baris pertama sheet harus berisi nama kolom (header).');
+  }
+  var record = {};
+  Object.keys(inputs).forEach(function (k) { record[k] = inputs[k]; });
+
+  // boundary on write: the owner column is ALWAYS the caller, never client input
+  if (service.dataBoundary && service.dataBoundary.ownerColumn) {
+    record[service.dataBoundary.ownerColumn] = identity.email;
+  }
+  if (headers.indexOf('submitted_at') !== -1 && record.submitted_at === undefined) {
+    record.submitted_at = new Date().toISOString();
+  }
+
+  var row = headers.map(function (hdr) { return record[hdr] !== undefined ? record[hdr] : ''; });
+  sheet.appendRow(row);
+  return { appended: 1, columnsMatched: headers.filter(function (hdr) { return record[hdr] !== undefined; }).length };
+}
+
+// ---------------------------------------------------------- report + email --
+
+function NcReportExport_(identity, service, inputs) {
+  var rows;
+  if (service.source && service.source.spreadsheetId) {
+    rows = NcSheetRead_(identity, {
+      spreadsheetId: service.source.spreadsheetId,
+      sheet: service.source.sheet,
+      dataBoundary: service.dataBoundary,
+      maxRows: service.maxRows
+    });
+  } else if (Array.isArray(inputs.rows)) {
+    rows = inputs.rows;
+  } else {
+    throw NcErr_('CONFIG', 'REPORT_EXPORT butuh service.source.spreadsheetId atau inputs.rows (array).');
+  }
+  if (!rows.length) throw NcErr_('EMPTY_REPORT', 'Tidak ada data untuk diekspor.');
+
+  var format = String(inputs.format || service.format || 'csv').toLowerCase();
+  var stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  var baseName = (service.fileName || 'ncgas_report') + '_' + stamp;
+  var folder = NcReportFolder_();
+
+  if (format === 'csv') {
+    var csv = NcToCsv_(rows);
+    var file = folder.createFile(baseName + '.csv', csv, 'text/csv');
+    return { url: file.getUrl(), fileId: file.getId(), rows: rows.length, format: 'csv' };
+  }
+  if (format === 'xlsx') {
+    var temp = SpreadsheetApp.create('tmp_' + baseName);
+    var headers = Object.keys(rows[0]);
+    var data = [headers].concat(rows.map(function (row) {
+      return headers.map(function (hdr) { return row[hdr] !== undefined ? row[hdr] : ''; });
+    }));
+    temp.getSheets()[0].getRange(1, 1, data.length, headers.length).setValues(data);
+    SpreadsheetApp.flush();
+    var exportUrl = 'https://www.googleapis.com/drive/v3/files/' + temp.getId() +
+      '/export?mimeType=application%2Fvnd.openxmlformats-officedocument.spreadsheetml.sheet';
+    var res = UrlFetchApp.fetch(exportUrl, {
+      headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() },
+      muteHttpExceptions: true
+    });
+    if (res.getResponseCode() !== 200) {
+      throw NcErr_('EXPORT_FAILED', 'Export XLSX gagal (' + res.getResponseCode() + '): ' + res.getContentText().slice(0, 200));
+    }
+    var blob = res.getBlob().setName(baseName + '.xlsx');
+    var out = folder.createFile(blob);
+    DriveApp.getFileById(temp.getId()).setTrashed(true);
+    return { url: out.getUrl(), fileId: out.getId(), rows: rows.length, format: 'xlsx' };
+  }
+  throw NcErr_('CONFIG', 'Format report tidak didukung: ' + format + ' (pakai csv atau xlsx).');
+}
+
+function NcReportFolder_() {
+  var name = 'NCGAS_Reports';
+  var it = DriveApp.getFoldersByName(name);
+  return it.hasNext() ? it.next() : DriveApp.createFolder(name);
+}
+
+function NcToCsv_(rows) {
+  var headers = Object.keys(rows[0]);
+  var esc = function (v) {
+    var s = v === null || v === undefined ? '' : String(v);
+    return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  };
+  var lines = [headers.map(esc).join(',')];
+  rows.forEach(function (row) {
+    lines.push(headers.map(function (hdr) { return esc(row[hdr]); }).join(','));
+  });
+  return lines.join('\r\n');
+}
+
+/**
+ * Workspace Emailing Engine — {{token}} templates resolved from inputs +
+ * identity, every value HTML-escaped before hitting the template.
+ * Attachments: inputs.attachments = [{ name, mimeType, base64 }]
+ */
+function NcEmailSend_(identity, service, inputs) {
+  var scope = {};
+  Object.keys(inputs).forEach(function (k) { scope[k] = inputs[k]; });
+  scope.email = scope.email || identity.email;
+
+  var interpolate = function (template) {
+    return String(template || '').replace(/\{\{\s*([a-zA-Z0-9_.]+)\s*\}\}/g, function (_, key) {
+      var v = scope[key];
+      if (v === undefined || v === null) throw NcErr_('TEMPLATE_TOKEN', 'Token email {{' + key + '}} tidak ada di inputs.');
+      return NcEscapeHtml_(String(v));
+    });
+  };
+
+  var to = interpolate(inputs.to || service.to);
+  if (!to || !/@/.test(to)) throw NcErr_('CONFIG', 'Alamat tujuan email tidak valid: `' + to + '`');
+  var subject = interpolate(inputs.subject || service.subject || '(tanpa subjek)');
+  var html = interpolate(service.htmlTemplate || '<p>{{message}}</p>');
+
+  var attachments = [];
+  (inputs.attachments || []).forEach(function (att, i) {
+    if (!att || !att.base64 || !att.name) throw NcErr_('ATTACHMENT', 'Attachment #' + i + ' butuh { name, mimeType, base64 }.');
+    attachments.push(Utilities.newBlob(Utilities.base64Decode(att.base64), att.mimeType || 'application/octet-stream', att.name));
+  });
+
+  GmailApp.sendEmail(to, subject, html.replace(/<[^>]+>/g, ' '), {
+    htmlBody: html,
+    attachments: attachments,
+    name: NCGAS_BLUEPRINT.meta.name
+  });
+  return { sent: true, to: to, attachments: attachments.length };
+}
+
+// ------------------------------------------------------------- custom RPC --
+
+function NcCustomRpc_(identity, service, inputs) {
+  var fnName = service.functionName;
+  if (typeof CustomHandlers === 'undefined' || typeof CustomHandlers[fnName] !== 'function') {
+    throw NcErr_('NOT_IMPLEMENTED', 'GAS_RPC `' + fnName + '` belum diimplementasi. ' +
+      'Buka editor project ini, isi CustomHandlers.gs dengan fungsi tersebut, lalu simpan.');
+  }
+  return CustomHandlers[fnName](inputs, { user: identity, blueprint: NCGAS_BLUEPRINT });
+}
+
+// ---------------------------------------------------------------- helpers --
+
+function NcOk_(data) { return JSON.stringify({ ok: true, data: data }); }
+function NcFail_(code, message, details) {
+  return JSON.stringify({ ok: false, error: { code: code, message: message, details: details || null } });
+}
+function NcErr_(code, message, details) {
+  var e = new Error(message);
+  e.ncCode = code;
+  e.ncDetails = details;
+  return e;
+}
+function NcEscapeHtml_(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+function NcJsEmbed_(json) {
+  return json.replace(/<\//g, '<\\/').replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029');
+}
