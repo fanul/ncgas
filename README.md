@@ -44,6 +44,12 @@ Script web app with one click.
    row/col purely from each component's row value (transiently fractional, e.g. `1.5`,
    to mean "insert a row between 1 and 2") and its position in the page's component
    array. One code path to get right, instead of one per gesture.
+6. **Two editing surfaces over one blueprint, not two blueprints.** Flow View (node
+   graph) and Design View (WYSIWYG grid) both read/write the exact same `layoutGrid`,
+   `services`, `properties` fields — a wire dragged in Flow View and a dropdown picked
+   in Inspector produce byte-identical JSON. Node `{x,y}` canvas positions are the only
+   Flow-View-only data (`comp._flow`, `page._flow`, `page._flowServices`), and they're
+   cosmetic — deleting them just re-triggers auto-layout, nothing breaks.
 
 ## Blueprint contract (AST)
 
@@ -189,6 +195,40 @@ to write to, so the mock adapter hands back the actual uploaded bytes as a `data
 you see your real image working in preview, not a placeholder.
 ⚠️ *The `doGet` image-serving route is GAS-runtime-only behavior that can't be executed in
 this local/Node environment — verify it once on a real deployment before relying on it.*
+
+## Flow View — KNIME-style node editor
+
+The builder opens in **Flow View** by default (toggle: Flow / Desain / Preview in the
+topbar). It's a node-graph editing surface layered over the same blueprint Design View
+edits, at two zoom levels:
+
+- **App level** — every page is a draggable node; edges are auto-derived from
+  `NAVIGATE` service bindings anywhere in the app (a button/etc. whose `onClick` action
+  is `NAVIGATE` draws an edge from its page to the target page). Double-click a page
+  node to drill into it.
+- **Page level** — every component and every app service is a node. Edges are derived
+  from the existing binding fields — `services[event].action`, `properties.dependsOn`,
+  `properties.relatedTo`, column `rollup`, `uploadService`/`pdfExportService` — so
+  everything already wired via Inspector shows up immediately as a graph, no migration
+  needed. Two relationship kinds are **drag-to-wire**: drag a component's event port
+  (small circle, e.g. `onClick`) onto a service node to bind it
+  (`comp.services[event] = {action: serviceId}`), or drag a `FORM_SELECT`/input's
+  `value` port onto another `FORM_SELECT`'s `dependsOn` port to cascade it. Click a wire
+  to remove it. Every app service always renders as a node on every page (dimmed if
+  unused there) so it stays a valid drop target even after its last reference is
+  removed — a service node never has to "already be wired" to be wireable.
+- **Inline node config** — click a node's ⚙ to expand its property fields right on the
+  canvas (same field components Inspector uses). `CRUD_TABLE` nodes embed the full
+  `CrudWizard.vue` inline rather than a slimmed-down version, since its data-source/
+  columns/master-detail config doesn't compress well into a summary view.
+
+Design View is unchanged — it's the exact same `Canvas.vue`/`Palette.vue`/`Inspector.vue`
+WYSIWYG grid editor from before, reachable via the mode toggle, for laying out how a page
+actually *looks* (row/col placement) as opposed to how its pieces are *wired*.
+
+Not yet drag-wireable (edit via a node's inline config or Inspector instead): master-detail
+(`relatedTo`), rollup columns, `uploadService`, `pdfExportService`, and `NAVIGATE` targets —
+these still render as graph edges, just aren't created by dragging yet.
 
 ## Menu management (sidebar navigation)
 

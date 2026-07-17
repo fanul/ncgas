@@ -5,6 +5,7 @@ import Palette from './ui/Palette.vue';
 import Canvas from './ui/Canvas.vue';
 import Inspector from './ui/Inspector.vue';
 import Preview from './ui/Preview.vue';
+import FlowView from './ui/FlowView.vue';
 import { useNoCodeEngine } from './store/useNoCodeEngine.js';
 
 const engine = useNoCodeEngine();
@@ -68,12 +69,13 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown));
       <button class="ed-btn-icon" @click="state.deployResult = null">✕</button>
     </div>
 
-    <main v-if="state.blueprint" class="ed-body" :class="{ 'is-preview': state.mode === 'preview' }">
+    <main v-if="state.blueprint" class="ed-body" :class="{ 'is-preview': state.mode === 'preview', 'is-flow': state.mode === 'flow' }">
       <template v-if="state.mode === 'design'">
         <Palette />
         <Canvas />
         <Inspector />
       </template>
+      <FlowView v-else-if="state.mode === 'flow'" />
       <Preview v-else />
     </main>
     <div v-else class="ed-loading">Memuat workspace…</div>

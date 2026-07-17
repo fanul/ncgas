@@ -27,7 +27,8 @@ const state = reactive({
   blueprint: null,
   currentPageId: null,
   selectedId: null,          // selected component id (null => page/app inspector)
-  mode: 'design',            // 'design' | 'preview'
+  mode: 'flow',               // 'flow' | 'design' | 'preview'
+  flowDrilledIn: false,      // flow mode only: false = app-level page graph, true = current page's node graph
   previewRoles: ['Admin'],   // simulated roles in preview
   identity: { email: '…', roles: [] },
   isGasHost,
@@ -348,6 +349,86 @@ function reorderPage(pageId, dir) {
 function selectPage(pageId) {
   state.currentPageId = pageId;
   state.selectedId = null;
+  state.flowDrilledIn = true;
+}
+
+// -------------------------------------------------------------- flow view --
+// KNIME-style node graph: app-level (pages as nodes, edges auto-derived from
+// NAVIGATE bindings) and page-level (components/services as nodes, manually
+// wired). Node {x,y} positions are cosmetic-only (don't affect the deployed
+// app) so they mutate directly rather than through commit() — same
+// direct-mutation convention Inspector.vue already uses for page/app text
+// fields. Wiring actions (event->service, dependsOn) write into the exact
+// same fields the Inspector's dropdown-based binding UI writes, so both
+// editing surfaces stay interchangeable.
+
+function enterPageFlow(pageId) {
+  state.currentPageId = pageId;
+  state.selectedId = null;
+  state.flowDrilledIn = true;
+}
+
+function exitPageFlow() {
+  state.flowDrilledIn = false;
+}
+
+function setComponentFlowPos(id, pos) {
+  const found = findComponent(id);
+  if (!found) return;
+  found.comp._flow = { x: Math.round(pos.x), y: Math.round(pos.y) };
+  state.dirty = true;
+}
+
+function setPageFlowPos(pageId, pos) {
+  const page = state.blueprint?.pages?.[pageId];
+  if (!page) return;
+  page._flow = { x: Math.round(pos.x), y: Math.round(pos.y) };
+  state.dirty = true;
+}
+
+function setServiceFlowPos(pageId, serviceId, pos) {
+  const page = state.blueprint?.pages?.[pageId];
+  if (!page) return;
+  if (!page._flowServices) page._flowServices = {};
+  page._flowServices[serviceId] = { x: Math.round(pos.x), y: Math.round(pos.y) };
+  state.dirty = true;
+}
+
+function wireEventToService(compId, event, serviceId) {
+  const found = findComponent(compId);
+  if (!found || !state.blueprint.sharedServices[serviceId]) return;
+  if (!found.comp.services) found.comp.services = {};
+  const existing = found.comp.services[event] || {};
+  found.comp.services[event] = { inputs: {}, ...existing, action: serviceId };
+  state.dirty = true;
+  state.previewNonce++;
+  toast('success', `${compId}.${event} → ${serviceId} tersambung.`);
+}
+
+function unwireEvent(compId, event) {
+  const found = findComponent(compId);
+  if (!found?.comp.services?.[event]) return;
+  delete found.comp.services[event];
+  state.dirty = true;
+  state.previewNonce++;
+}
+
+function wireDependsOn(compId, sourceId) {
+  const found = findComponent(compId);
+  if (!found || compId === sourceId) return;
+  if (!found.comp.properties) found.comp.properties = {};
+  found.comp.properties.dependsOn = sourceId;
+  state.dirty = true;
+  state.previewNonce++;
+  toast('success', `${compId} bergantung pada ${sourceId}.`);
+}
+
+function unwireDependsOn(compId) {
+  const found = findComponent(compId);
+  if (!found) return;
+  delete found.comp.properties.dependsOn;
+  state.dirty = true;
+  state.previewNonce++;
 }
 
 // -------------------------------------------------------------- menu actions --
@@ -631,6 +712,15 @@ export function useNoCodeEngine() {
     renamePage,
     reorderPage,
     selectPage,
+    enterPageFlow,
+    exitPageFlow,
+    setComponentFlowPos,
+    setPageFlowPos,
+    setServiceFlowPos,
+    wireEventToService,
+    unwireEvent,
+    wireDependsOn,
+    unwireDependsOn,
     addMenuItem,
     addMenuChildItem,
     removeMenuItem,

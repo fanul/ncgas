@@ -55,10 +55,11 @@ function runValidate() {
       <button class="ed-btn ed-btn-ghost" :disabled="!state.undoStack.length" title="Ctrl+Z" @click="engine.undo()">↩</button>
       <button class="ed-btn ed-btn-ghost" :disabled="!state.redoStack.length" title="Ctrl+Shift+Z" @click="engine.redo()">↪</button>
       <button class="ed-btn ed-btn-ghost" @click="runValidate">Validasi</button>
-      <button class="ed-btn ed-btn-ghost" :class="{ 'is-active': state.mode === 'preview' }"
-              @click="state.mode = state.mode === 'design' ? 'preview' : 'design'; state.previewNonce++">
-        {{ state.mode === 'design' ? '▶ Preview' : '✎ Desain' }}
-      </button>
+      <div class="ed-modeswitch">
+        <button class="ed-modebtn" :class="{ 'is-active': state.mode === 'flow' }" title="Flow — node halaman/komponen/service" @click="state.mode = 'flow'">🔀 Flow</button>
+        <button class="ed-modebtn" :class="{ 'is-active': state.mode === 'design' }" title="Design — kanvas WYSIWYG" @click="state.mode = 'design'">✎ Desain</button>
+        <button class="ed-modebtn" :class="{ 'is-active': state.mode === 'preview' }" title="Preview — jalankan aplikasi" @click="state.mode = 'preview'; state.previewNonce++">▶ Preview</button>
+      </div>
       <button class="ed-btn" :disabled="state.busy !== null" @click="engine.save()">
         {{ state.busy === 'saving' ? 'Menyimpan…' : 'Simpan' }}
       </button>

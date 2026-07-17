@@ -9,7 +9,7 @@
     "build": "vite build",
     "build:gas": "vite build --mode gas && node scripts/sync-gas.mjs",
     "sync:gas": "node scripts/sync-gas.mjs",
-    "test": "node --test tests/expression-engine.test.mjs tests/blueprint-utils.test.mjs",
+    "test": "node --test tests/expression-engine.test.mjs tests/blueprint-utils.test.mjs tests/flow-graph.test.mjs",
     "preview": "vite preview"
   },
   "dependencies": {
