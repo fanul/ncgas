@@ -54,6 +54,59 @@ test('member, index and array literals', () => {
   assert.equal(E.evaluate('state.employees[0]["salary"]', scope), 5000000);
 });
 
+test('object literals', () => {
+  assert.deepEqual(E.evaluate("{a: 1, b: 'x'}", {}), { a: 1, b: 'x' });
+  assert.deepEqual(E.evaluate('{}', {}), {});
+  assert.deepEqual(E.evaluate("{'quoted key': 1}", {}), { 'quoted key': 1 });
+  assert.equal(E.evaluate('{a: 1}.a', {}), 1);
+  assert.deepEqual(
+    E.evaluate("[{nama:'Bandung',provinsi_id:'jabar'},{nama:'Surabaya',provinsi_id:'jatim'}]", {}),
+    [{ nama: 'Bandung', provinsi_id: 'jabar' }, { nama: 'Surabaya', provinsi_id: 'jatim' }]
+  );
+  assert.throws(() => E.parse('{__proto__: 1}'), /SECURITY/);
+  assert.throws(() => E.parse('{constructor: 1}'), /SECURITY/);
+  assert.throws(() => E.parse('{prototype: 1}'), /SECURITY/);
+});
+
+test('object literals compose with whereEquals/pluck for cascading dropdown data', () => {
+  const expr = "pluck(whereEquals([" +
+    "{nama:'Bandung',provinsi_id:'jabar'},{nama:'Cimahi',provinsi_id:'jabar'},{nama:'Surabaya',provinsi_id:'jatim'}" +
+    "], 'provinsi_id', selectedProvince), 'nama')";
+  assert.deepEqual(E.evaluate(expr, { selectedProvince: 'jabar' }), ['Bandung', 'Cimahi']);
+  assert.deepEqual(E.evaluate(expr, { selectedProvince: 'jatim' }), ['Surabaya']);
+});
+
+test('groupBySum / groupByCount for dashboard aggregation', () => {
+  const cart = [
+    { product: 'Kopi', qty: 2, total: 30000 },
+    { product: 'Teh', qty: 1, total: 10000 },
+    { product: 'Kopi', qty: 1, total: 15000 }
+  ];
+  assert.deepEqual(
+    E.evaluate("groupBySum(cart, 'product', 'total')", { cart }),
+    [{ key: 'Kopi', total: 45000 }, { key: 'Teh', total: 10000 }]
+  );
+  assert.deepEqual(
+    E.evaluate("groupByCount(cart, 'product')", { cart }),
+    [{ key: 'Kopi', count: 2 }, { key: 'Teh', count: 1 }]
+  );
+  assert.deepEqual(
+    E.evaluate("pluck(groupBySum(cart, 'product', 'total'), 'key')", { cart }),
+    ['Kopi', 'Teh']
+  );
+  assert.throws(() => E.evaluate("groupBySum(cart, 'constructor', 'total')", { cart }), /SECURITY/);
+});
+
+test('sumProduct for cart totals (qty * price, no lambda needed)', () => {
+  const cart = [
+    { nama: 'Kopi Susu', qty: 2, harga: 18000 },
+    { nama: 'Roti Bakar', qty: 1, harga: 15000 }
+  ];
+  assert.equal(E.evaluate("sumProduct(cart, 'qty', 'harga')", { cart }), 51000);
+  assert.equal(E.evaluate('sumProduct(cart, \'qty\', \'harga\')', { cart: [] }), 0);
+  assert.throws(() => E.evaluate("sumProduct(cart, 'qty', '__proto__')", { cart }), /SECURITY/);
+});
+
 test('built-in functions', () => {
   assert.equal(E.evaluate('round(3.14159, 2)', {}), 3.14);
   assert.equal(E.evaluate("upper('abc')", {}), 'ABC');
@@ -62,6 +115,18 @@ test('built-in functions', () => {
   assert.equal(E.evaluate('sum([1,2,3])', {}), 6);
   assert.equal(E.evaluate("sum(pluck(state.employees, 'salary'))", scope), 12000000);
   assert.throws(() => E.evaluate("pluck(state.employees, 'constructor')", scope), /SECURITY/);
+});
+
+test('whereEquals: declarative row filter for cascading dropdowns, no lambda needed', () => {
+  const wilayah = [
+    { nama: 'Bandung', provinsi_id: 'jabar' },
+    { nama: 'Cimahi', provinsi_id: 'jabar' },
+    { nama: 'Surabaya', provinsi_id: 'jatim' }
+  ];
+  const ctx = { wilayah };
+  assert.deepEqual(E.evaluate("pluck(whereEquals(wilayah, 'provinsi_id', 'jabar'), 'nama')", ctx), ['Bandung', 'Cimahi']);
+  assert.deepEqual(E.evaluate("whereEquals(wilayah, 'provinsi_id', 'dki')", ctx), []);
+  assert.throws(() => E.evaluate("whereEquals(wilayah, 'constructor', 'x')", ctx), /SECURITY/);
   assert.equal(E.evaluate('formatNumber(1234567.5, 1)', {}), '1.234.567,5');
   assert.equal(E.evaluate('formatIDR(5000000)', {}), 'Rp 5.000.000');
   assert.equal(E.evaluate("len('abc') + len([1,2])", {}), 5);

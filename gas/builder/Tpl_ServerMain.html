@@ -9,6 +9,14 @@ var NCGAS_BLUEPRINT = "__NCGAS_BLUEPRINT_JSON__";
 // ------------------------------------------------------------------ web app --
 
 function doGet(e) {
+  // Uploaded images are served through this same web app URL (?action=ncgas_image&fileId=...)
+  // rather than made public in Drive — access is gated by the SAME auth check as every
+  // other request below, not by Drive sharing settings. Checked first, before the normal
+  // page-render path.
+  if (e && e.parameter && e.parameter.action === 'ncgas_image') {
+    return NcServeImage_(e);
+  }
+
   var identity = NcIdentity_();
   var settings = NCGAS_BLUEPRINT.meta.globalSettings;
 
@@ -25,6 +33,26 @@ function doGet(e) {
   return tpl.evaluate()
     .setTitle(NCGAS_BLUEPRINT.meta.name)
     .addMetaTag('viewport', 'width=device-width, initial-scale=1');
+}
+
+/**
+ * Serves an uploaded Drive file's bytes directly (not a public Drive link).
+ * Files stay owner-private in Drive; this is the only path that can read
+ * them, and it requires the same identity check as the rest of the app.
+ */
+function NcServeImage_(e) {
+  var identity = NcIdentity_();
+  var settings = NCGAS_BLUEPRINT.meta.globalSettings;
+  if (settings.authStrategy !== 'PUBLIC' && !identity.email) {
+    return HtmlService.createHtmlOutput('<p style="font-family:sans-serif">403 Forbidden</p>');
+  }
+  var fileId = e.parameter.fileId;
+  if (!fileId) return HtmlService.createHtmlOutput('<p style="font-family:sans-serif">400 Missing fileId</p>');
+  try {
+    return DriveApp.getFileById(fileId).getBlob();
+  } catch (err) {
+    return HtmlService.createHtmlOutput('<p style="font-family:sans-serif">404 Not found</p>');
+  }
 }
 
 /** Run once from the script editor after the first deploy to grant scopes. */
@@ -131,8 +159,12 @@ function NcRunService_(identity, payload) {
   switch (service.type) {
     case 'SHEET_READ': return NcSheetRead_(identity, service);
     case 'SHEET_APPEND': return NcSheetAppend_(identity, service, inputs);
+    case 'SHEET_UPDATE': return NcSheetUpdate_(identity, service, inputs);
+    case 'SHEET_DELETE': return NcSheetDelete_(identity, service, inputs);
     case 'REPORT_EXPORT': return NcReportExport_(identity, service, inputs);
     case 'EMAIL_SEND': return NcEmailSend_(identity, service, inputs);
+    case 'PDF_EXPORT': return NcPdfExport_(identity, service, inputs);
+    case 'DRIVE_UPLOAD': return NcDriveUpload_(identity, service, inputs);
     case 'GAS_RPC': return NcCustomRpc_(identity, service, inputs);
     default: throw NcErr_('UNSUPPORTED_TYPE', 'Tipe service `' + service.type + '` tidak dikenali runtime ini.');
   }
@@ -195,6 +227,14 @@ function NcSheetAppend_(identity, service, inputs) {
   var record = {};
   Object.keys(inputs).forEach(function (k) { record[k] = inputs[k]; });
 
+  // auto-generate the key column when the caller didn't supply one (typical for CRUD_TABLE
+  // "add" forms, which hide the key field) — opt-in via service.keyColumn, backward compatible
+  // with plain SHEET_APPEND services that never set it.
+  if (service.keyColumn && headers.indexOf(service.keyColumn) !== -1 &&
+      (record[service.keyColumn] === undefined || record[service.keyColumn] === '')) {
+    record[service.keyColumn] = Utilities.getUuid().slice(0, 8);
+  }
+
   // boundary on write: the owner column is ALWAYS the caller, never client input
   if (service.dataBoundary && service.dataBoundary.ownerColumn) {
     record[service.dataBoundary.ownerColumn] = identity.email;
@@ -205,7 +245,70 @@ function NcSheetAppend_(identity, service, inputs) {
 
   var row = headers.map(function (hdr) { return record[hdr] !== undefined ? record[hdr] : ''; });
   sheet.appendRow(row);
-  return { appended: 1, columnsMatched: headers.filter(function (hdr) { return record[hdr] !== undefined; }).length };
+  return { appended: 1, key: record[service.keyColumn], columnsMatched: headers.filter(function (hdr) { return record[hdr] !== undefined; }).length };
+}
+
+/** Locates the row (1-based sheet row number, including header) whose keyColumn matches keyValue. */
+function NcFindRowIndex_(sheet, headers, keyColumn, keyValue) {
+  var keyIdx = headers.indexOf(keyColumn);
+  if (keyIdx === -1) throw NcErr_('SHEET_SCHEMA', 'Kolom kunci `' + keyColumn + '` tidak ditemukan di header sheet.');
+  var values = sheet.getDataRange().getValues();
+  for (var r = 1; r < values.length; r++) {
+    if (String(values[r][keyIdx]) === String(keyValue)) return { rowNumber: r + 1, rowValues: values[r] };
+  }
+  return null;
+}
+
+/** Enforces dataBoundary ownership on an already-located row; throws FORBIDDEN if the caller doesn't own it. */
+function NcCheckRowOwnership_(identity, service, headers, rowValues) {
+  var boundary = NcBoundaryActive_(identity, service);
+  if (!boundary) return;
+  var ownerIdx = headers.indexOf(boundary.ownerColumn);
+  if (ownerIdx === -1) {
+    throw NcErr_('BOUNDARY_CONFIG', 'Kolom boundary `' + boundary.ownerColumn + '` tidak ditemukan — akses ditolak (fail closed).');
+  }
+  if (String(rowValues[ownerIdx]).toLowerCase() !== identity.email.toLowerCase()) {
+    throw NcErr_('FORBIDDEN', '403 Forbidden: baris ini bukan milik Anda.');
+  }
+}
+
+function NcSheetUpdate_(identity, service, inputs) {
+  var sheet = NcOpenSheet_(service);
+  var lastCol = Math.max(1, sheet.getLastColumn());
+  var headers = sheet.getRange(1, 1, 1, lastCol).getValues()[0].map(String);
+  var keyValue = inputs.key;
+  if (keyValue === undefined || keyValue === null || keyValue === '') {
+    throw NcErr_('MISSING_KEY', 'SHEET_UPDATE membutuhkan `key` pada inputs.');
+  }
+  var found = NcFindRowIndex_(sheet, headers, service.keyColumn, keyValue);
+  if (!found) throw NcErr_('NOT_FOUND', 'Baris dengan ' + service.keyColumn + ' = ' + keyValue + ' tidak ditemukan.');
+  NcCheckRowOwnership_(identity, service, headers, found.rowValues);
+
+  var boundary = NcBoundaryActive_(identity, service);
+  var record = (inputs.record && typeof inputs.record === 'object') ? inputs.record : {};
+  var newRow = headers.map(function (hdr, i) {
+    if (hdr === service.keyColumn) return found.rowValues[i]; // identity column never changes via update
+    if (boundary && hdr === boundary.ownerColumn) return found.rowValues[i]; // ownership never changes via update
+    return record[hdr] !== undefined ? record[hdr] : found.rowValues[i];
+  });
+  sheet.getRange(found.rowNumber, 1, 1, headers.length).setValues([newRow]);
+  return { updated: 1 };
+}
+
+function NcSheetDelete_(identity, service, inputs) {
+  var sheet = NcOpenSheet_(service);
+  var lastCol = Math.max(1, sheet.getLastColumn());
+  var headers = sheet.getRange(1, 1, 1, lastCol).getValues()[0].map(String);
+  var keyValue = inputs.key;
+  if (keyValue === undefined || keyValue === null || keyValue === '') {
+    throw NcErr_('MISSING_KEY', 'SHEET_DELETE membutuhkan `key` pada inputs.');
+  }
+  var found = NcFindRowIndex_(sheet, headers, service.keyColumn, keyValue);
+  if (!found) throw NcErr_('NOT_FOUND', 'Baris dengan ' + service.keyColumn + ' = ' + keyValue + ' tidak ditemukan.');
+  NcCheckRowOwnership_(identity, service, headers, found.rowValues);
+
+  sheet.deleteRow(found.rowNumber);
+  return { deleted: 1 };
 }
 
 // ---------------------------------------------------------- report + email --
@@ -265,6 +368,57 @@ function NcReportFolder_() {
   var name = 'NCGAS_Reports';
   var it = DriveApp.getFoldersByName(name);
   return it.hasNext() ? it.next() : DriveApp.createFolder(name);
+}
+
+/**
+ * PDF_EXPORT — converts an already-rendered HTML string (e.g. a PRINT_BUTTON
+ * receipt) to a PDF saved in Drive. Fidelity is basic (GAS's HTML->PDF blob
+ * conversion, not a full browser rendering engine) — fine for simple receipts
+ * and reports, not pixel-perfect layouts.
+ */
+function NcPdfExport_(identity, service, inputs) {
+  var html = inputs.html;
+  if (!html || typeof html !== 'string') throw NcErr_('MISSING_FIELD', 'PDF_EXPORT membutuhkan `html` pada inputs.');
+  var folder = NcReportFolder_();
+  var stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  var baseName = String(service.fileName || inputs.fileName || 'ncgas_doc').replace(/[^a-zA-Z0-9_\-]+/g, '_') + '_' + stamp;
+  var htmlBlob = Utilities.newBlob(html, 'text/html', baseName + '.html');
+  var pdfBlob = htmlBlob.getAs('application/pdf').setName(baseName + '.pdf');
+  var file = folder.createFile(pdfBlob);
+  return { url: file.getUrl(), fileId: file.getId() };
+}
+
+function NcUploadFolder_(service) {
+  var name = service.folderName || ('NCGAS_Uploads_' + NCGAS_BLUEPRINT.appId);
+  var it = DriveApp.getFoldersByName(name);
+  return it.hasNext() ? it.next() : DriveApp.createFolder(name);
+}
+
+/**
+ * Saves an uploaded file to Drive, owner-private (no sharing changes) — it's
+ * only ever readable through NcServeImage_ (doGet ?action=ncgas_image), which
+ * re-checks identity on every request. Never make this folder/file public;
+ * that would defeat the whole point of gating access through the app itself.
+ */
+function NcDriveUpload_(identity, service, inputs) {
+  if (!inputs.filename || !inputs.base64) {
+    throw NcErr_('MISSING_FIELD', 'DRIVE_UPLOAD membutuhkan filename dan base64 pada inputs.');
+  }
+  var maxMB = service.maxSizeMB || 5;
+  var bytes;
+  try {
+    bytes = Utilities.base64Decode(inputs.base64);
+  } catch (e) {
+    throw NcErr_('BAD_PAYLOAD', 'base64 tidak valid: ' + e.message);
+  }
+  if (bytes.length > maxMB * 1024 * 1024) {
+    throw NcErr_('TOO_LARGE', 'Ukuran file melebihi batas ' + maxMB + 'MB.');
+  }
+  var folder = NcUploadFolder_(service);
+  var blob = Utilities.newBlob(bytes, inputs.mimeType || 'application/octet-stream', inputs.filename);
+  var file = folder.createFile(blob);
+  var url = ScriptApp.getService().getUrl() + '?action=ncgas_image&fileId=' + file.getId();
+  return { fileId: file.getId(), url: url };
 }
 
 function NcToCsv_(rows) {

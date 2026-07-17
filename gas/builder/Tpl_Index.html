@@ -15,6 +15,10 @@
   <!-- Vue 3 runtime (global build). For fully-offline domains, mirror this file
        internally and point the URL at your mirror before compiling. -->
   <script src="https://cdn.jsdelivr.net/npm/vue@3.5.13/dist/vue.global.prod.js"></script>
+  <!-- Chart.js, only needed if the blueprint uses a CHART component — best-effort,
+       the runtime shows a fallback message instead of failing the whole app if this
+       CDN is unreachable. Mirror it internally alongside Vue for offline domains. -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
 
   <script>
 /*__NCGAS_EXPRESSION_ENGINE__*/

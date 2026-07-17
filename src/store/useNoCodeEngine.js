@@ -3,6 +3,16 @@
  * Owns the blueprint AST, selection, mode, undo history and every
  * persistence/deploy action. All structural mutations go through commit()
  * so they are undoable; property edits mutate reactively in place.
+ *
+ * GRID LAYOUT MODEL: each component carries explicit { row, col, colSpan }.
+ * Callers never juggle row-shifting themselves — every placement helper below
+ * funnels through reflowPage(), which derives final row/col purely from
+ * (a) each component's *current* row value (which may be transiently
+ * fractional, e.g. 1.5, to mean "a new row between 1 and 2") and (b) their
+ * position in the page.components array (which decides left-to-right order
+ * *within* a row). This is the single source of truth for placement — drag,
+ * keyboard nudge, duplicate and paste all resolve to the same few primitives,
+ * so there is exactly one code path to get right instead of one per gesture.
  */
 import { reactive, computed } from 'vue';
 import { Blueprint, Expression } from '../engine.js';
@@ -29,6 +39,7 @@ const state = reactive({
   deployResult: null,
   undoStack: [],
   redoStack: [],
+  clipboard: null,           // last copied component (Ctrl+C / Ctrl+V)
   previewNonce: 0            // bump to rebuild the preview runtime store
 });
 
@@ -80,6 +91,76 @@ function uniqueComponentId(type) {
   let i = 2;
   while (ids.has(base + '_' + i)) i++;
   return base + '_' + i;
+}
+
+// ============================================================ grid layout ==
+
+/**
+ * Buckets page.components by their current (possibly fractional) row value,
+ * sorts buckets numerically, then packs each bucket left-to-right in array
+ * order — wrapping into a freshly-inserted row whenever colSpan overflows 12 —
+ * and finally renumbers everything to clean contiguous integers starting at 1.
+ */
+function reflowPage(page) {
+  const byRow = new Map();
+  page.components.forEach((c) => {
+    const r = c.layoutGrid?.row ?? 1;
+    if (!byRow.has(r)) byRow.set(r, []);
+    byRow.get(r).push(c);
+  });
+  const orderedKeys = [...byRow.keys()].sort((a, b) => a - b);
+  let rowNum = 1;
+  orderedKeys.forEach((key) => {
+    let col = 1;
+    let row = rowNum;
+    byRow.get(key).forEach((comp) => {
+      const span = Math.max(1, Math.min(12, comp.layoutGrid?.colSpan || 6));
+      if (col + span - 1 > 12) { row += 1; col = 1; }
+      comp.layoutGrid = { row, col, colSpan: span };
+      col += span;
+    });
+    rowNum = row + 1;
+  });
+}
+
+function pageMaxRow(page) {
+  return page.components.reduce((m, c) => Math.max(m, c.layoutGrid?.row || 1), 0);
+}
+
+/** comp must already be OUT of page.components. Appends it to the end of `row`. */
+function placeAtEndOfRow(page, comp, row) {
+  comp.layoutGrid = { row, col: 1, colSpan: comp.layoutGrid?.colSpan || 6 };
+  page.components.push(comp);
+  reflowPage(page);
+}
+
+/** comp must already be OUT of page.components. Inserts a fresh row immediately before `beforeRow`. */
+function placeInNewRowBefore(page, comp, beforeRow) {
+  comp.layoutGrid = { row: beforeRow - 0.5, col: 1, colSpan: comp.layoutGrid?.colSpan || 6 };
+  page.components.push(comp);
+  reflowPage(page);
+}
+
+/** comp must already be OUT of page.components. Inserts a fresh row after the current last row. */
+function placeInNewRowAtEnd(page, comp) {
+  comp.layoutGrid = { row: pageMaxRow(page) + 0.5, col: 1, colSpan: comp.layoutGrid?.colSpan || 6 };
+  page.components.push(comp);
+  reflowPage(page);
+}
+
+/** Default placement for a brand-new component: packs into the current last row, wraps if full. */
+function placeDefault(page, comp, colSpan) {
+  comp.layoutGrid = { row: pageMaxRow(page) || 1, col: 1, colSpan };
+  page.components.push(comp);
+  reflowPage(page);
+}
+
+/** Dispatches a drop-target descriptor ({mode:'row'|'newRowBefore'|'newRowEnd', row}) to the right primitive. */
+function placeAtTarget(page, comp, target) {
+  if (!target) return placeDefault(page, comp, comp.layoutGrid?.colSpan || 6);
+  if (target.mode === 'row') return placeAtEndOfRow(page, comp, target.row);
+  if (target.mode === 'newRowBefore') return placeInNewRowBefore(page, comp, target.row);
+  return placeInNewRowAtEnd(page, comp);
 }
 
 // ------------------------------------------------------------------ actions --
@@ -193,10 +274,13 @@ async function deploy() {
 }
 
 // ------------------------------------------------------------ page actions --
+// NCGAS -> ALL PAGES -> Page: pages are a keyed object, but key insertion
+// order is the display order (guaranteed by spec for string keys) — reorder
+// rebuilds the object in the new order rather than sorting anything at read time.
 
-function addPage() {
+function addPage(title) {
   commit(() => {
-    const page = Blueprint.createEmptyPage('Page Baru');
+    const page = Blueprint.createEmptyPage(title || 'Halaman Baru');
     const id = Blueprint.uid('pg');
     state.blueprint.pages[id] = page;
     state.currentPageId = id;
@@ -219,14 +303,120 @@ function removePage(pageId) {
   });
 }
 
+function duplicatePage(pageId) {
+  const src = state.blueprint.pages[pageId];
+  if (!src) return;
+  commit(() => {
+    const clone = JSON.parse(JSON.stringify(src));
+    clone.settings.title = clone.settings.title + ' (copy)';
+    let route = clone.settings.route + '-copy';
+    let n = 2;
+    while (Object.values(state.blueprint.pages).some((p) => p.settings.route === route)) {
+      route = clone.settings.route + '-copy' + (n++);
+    }
+    clone.settings.route = route;
+    const newPageId = Blueprint.uid('pg');
+    state.blueprint.pages[newPageId] = clone; // attach first so uniqueComponentId sees live siblings
+    clone.components.forEach((c) => { c.id = uniqueComponentId(c.type); });
+    state.currentPageId = newPageId;
+    state.selectedId = null;
+  });
+  toast('info', 'Halaman diduplikasi. Referensi expression ke komponen asal TIDAK di-remap otomatis.');
+}
+
+function renamePage(pageId, title) {
+  const page = state.blueprint.pages[pageId];
+  if (!page || !title.trim()) return;
+  page.settings.title = title.trim();
+  state.dirty = true;
+}
+
+/** dir: -1 (move up/left in the page list) or +1 (move down/right). */
+function reorderPage(pageId, dir) {
+  const ids = Object.keys(state.blueprint.pages);
+  const i = ids.indexOf(pageId);
+  const j = i + dir;
+  if (i === -1 || j < 0 || j >= ids.length) return;
+  [ids[i], ids[j]] = [ids[j], ids[i]];
+  commit(() => {
+    const rebuilt = {};
+    ids.forEach((id) => { rebuilt[id] = state.blueprint.pages[id]; });
+    state.blueprint.pages = rebuilt;
+  });
+}
+
 function selectPage(pageId) {
   state.currentPageId = pageId;
   state.selectedId = null;
 }
 
+// -------------------------------------------------------------- menu actions --
+// bp.menu is an ordered tree, one level deep (groups hold page/link/divider
+// children, groups cannot nest). Structural ops (add/remove/reorder/move) go
+// through commit(); label/icon/pageId/url/allowedRoles edits mutate directly
+// from MenuManager.vue, same convention as page settings elsewhere.
+
+function ensureMenu() {
+  if (!Array.isArray(state.blueprint.menu)) state.blueprint.menu = [];
+  return state.blueprint.menu;
+}
+
+/** { list, idx } for the item's containing array — top-level menu or a specific group's children. */
+function findMenuContainer(id) {
+  const menu = ensureMenu();
+  let idx = menu.findIndex((m) => m.id === id);
+  if (idx !== -1) return { list: menu, idx };
+  for (const item of menu) {
+    if (item.type === 'group' && Array.isArray(item.children)) {
+      idx = item.children.findIndex((c) => c.id === id);
+      if (idx !== -1) return { list: item.children, idx };
+    }
+  }
+  return null;
+}
+
+function addMenuItem(type, opts = {}) {
+  commit(() => {
+    const menu = ensureMenu();
+    const item = { id: Blueprint.uid('mi'), type, allowedRoles: [], ...opts };
+    if (type === 'group' && !item.children) item.children = [];
+    if (!item.label && type !== 'divider') item.label = type === 'page' ? 'Halaman' : type === 'link' ? 'Tautan' : 'Grup';
+    menu.push(item);
+  });
+}
+
+function addMenuChildItem(groupId, type, opts = {}) {
+  commit(() => {
+    const group = ensureMenu().find((m) => m.id === groupId);
+    if (!group) return;
+    if (!Array.isArray(group.children)) group.children = [];
+    const item = { id: Blueprint.uid('mi'), type, allowedRoles: [], ...opts };
+    if (!item.label && type !== 'divider') item.label = type === 'page' ? 'Halaman' : 'Tautan';
+    group.children.push(item);
+  });
+}
+
+function removeMenuItem(id) {
+  const found = findMenuContainer(id);
+  if (!found) return;
+  commit(() => { found.list.splice(found.idx, 1); });
+}
+
+function reorderMenuItem(id, dir) {
+  const found = findMenuContainer(id);
+  if (!found) return;
+  const to = found.idx + dir;
+  if (to < 0 || to >= found.list.length) return;
+  commit(() => {
+    const [item] = found.list.splice(found.idx, 1);
+    found.list.splice(to, 0, item);
+  });
+}
+
 // ------------------------------------------------------- component actions --
 
-function addComponent(type, index = null) {
+/** target: null (default flow-append) | {mode:'row'|'newRowBefore'|'newRowEnd', row} */
+function addComponent(type, target = null) {
   const def = REGISTRY[type];
   if (!def) { toast('error', `Tipe komponen tidak dikenal: ${type}`); return; }
   const page = currentPage();
@@ -235,13 +425,12 @@ function addComponent(type, index = null) {
     const comp = {
       id: uniqueComponentId(type),
       type,
-      layoutGrid: { ...def.defaults.layoutGrid },
+      layoutGrid: { row: 1, col: 1, colSpan: def.defaultColSpan || 6 },
       properties: JSON.parse(JSON.stringify(def.defaults.properties)),
       services: {},
       rules: {}
     };
-    const at = index === null ? page.components.length : Math.max(0, Math.min(index, page.components.length));
-    page.components.splice(at, 0, comp);
+    placeAtTarget(page, comp, target);
     state.selectedId = comp.id;
   });
 }
@@ -251,6 +440,7 @@ function removeComponent(id) {
   if (!found) return;
   commit(() => {
     found.page.components.splice(found.idx, 1);
+    reflowPage(found.page); // compacts row numbers if one just emptied out
     if (state.selectedId === id) state.selectedId = null;
   });
 }
@@ -261,29 +451,71 @@ function duplicateComponent(id) {
   commit(() => {
     const clone = JSON.parse(JSON.stringify(found.comp));
     clone.id = uniqueComponentId(found.comp.type);
-    found.page.components.splice(found.idx + 1, 0, clone);
+    const idx = found.page.components.indexOf(found.comp);
+    found.page.components.splice(idx + 1, 0, clone); // lands right after original within the same row
+    reflowPage(found.page);
     state.selectedId = clone.id;
   });
 }
 
-function moveComponent(id, delta) {
+/** target: {mode:'row'|'newRowBefore'|'newRowEnd', row} — used by canvas drag-and-drop. */
+function moveComponentToTarget(id, target) {
   const found = findComponent(id);
   if (!found) return;
-  const to = found.idx + delta;
-  if (to < 0 || to >= found.page.components.length) return;
   commit(() => {
-    const [comp] = found.page.components.splice(found.idx, 1);
-    found.page.components.splice(to, 0, comp);
+    const { page, comp } = found;
+    const idx = page.components.indexOf(comp);
+    page.components.splice(idx, 1);
+    placeAtTarget(page, comp, target);
+    state.selectedId = comp.id;
   });
 }
 
-function moveComponentToIndex(id, index) {
+/** dir -1 = merge into the end of the previous row, +1 = merge into the end of the next row (or a fresh one). */
+function nudgeRow(id, dir) {
   const found = findComponent(id);
   if (!found) return;
+  const { page, comp } = found;
+  const row = comp.layoutGrid.row;
+  if (dir < 0 && row <= 1) return; // already topmost
   commit(() => {
-    const [comp] = found.page.components.splice(found.idx, 1);
-    const at = Math.max(0, Math.min(index > found.idx ? index - 1 : index, found.page.components.length));
-    found.page.components.splice(at, 0, comp);
+    const idx = page.components.indexOf(comp);
+    page.components.splice(idx, 1);
+    if (dir < 0) {
+      placeAtEndOfRow(page, comp, row - 1);
+    } else {
+      const last = pageMaxRow(page);
+      if (row > last) placeInNewRowAtEnd(page, comp); // was alone in the last row -> stays put
+      else placeAtEndOfRow(page, comp, row + 1);
+    }
+    state.selectedId = comp.id;
+  });
+}
+
+/** dir -1 = swap with the previous same-row sibling, +1 = swap with the next one. */
+function nudgeCol(id, dir) {
+  const found = findComponent(id);
+  if (!found) return;
+  const { page, comp } = found;
+  const rowMates = page.components.filter((c) => c.layoutGrid.row === comp.layoutGrid.row);
+  const pos = rowMates.indexOf(comp);
+  const swapWith = rowMates[pos + dir];
+  if (!swapWith) return; // already at that edge of the row
+  commit(() => {
+    const i1 = page.components.indexOf(comp);
+    const i2 = page.components.indexOf(swapWith);
+    [page.components[i1], page.components[i2]] = [page.components[i2], page.components[i1]];
+    reflowPage(page);
+  });
+}
+
+function setColSpan(id, colSpan) {
+  const found = findComponent(id);
+  if (!found) return;
+  const span = Math.max(1, Math.min(12, Math.round(Number(colSpan)) || 1));
+  commit(() => {
+    found.comp.layoutGrid.colSpan = span;
+    reflowPage(found.page);
   });
 }
 
@@ -298,6 +530,28 @@ function renameComponent(id, nextId) {
   });
   toast('info', `Referensi expression ke ${id} TIDAK di-rename otomatis — periksa rules/services.`);
   return true;
+}
+
+// ------------------------------------------------------------ copy / paste --
+
+function copyComponent(id) {
+  const found = findComponent(id ?? state.selectedId);
+  if (!found) { toast('error', 'Pilih komponen dulu untuk disalin.'); return; }
+  state.clipboard = JSON.parse(JSON.stringify(found.comp));
+  toast('info', `${found.comp.id} disalin (Ctrl+V untuk tempel).`);
+}
+
+function pasteComponent() {
+  if (!state.clipboard) { toast('error', 'Clipboard kosong — salin komponen dulu (Ctrl+C).'); return; }
+  const page = currentPage();
+  if (!page) return;
+  commit(() => {
+    const clone = JSON.parse(JSON.stringify(state.clipboard));
+    clone.id = uniqueComponentId(clone.type);
+    placeDefault(page, clone, clone.layoutGrid?.colSpan || 6);
+    state.selectedId = clone.id;
+  });
+  toast('success', `${state.clipboard.type} ditempel di akhir halaman.`);
 }
 
 // -------------------------------------------------------------- undo / redo --
@@ -352,7 +606,9 @@ async function importJson(file) {
 
 const selectedComponent = computed(() => (state.selectedId ? findComponent(state.selectedId)?.comp || null : null));
 const pageList = computed(() =>
-  Object.entries(state.blueprint?.pages || {}).map(([id, p]) => ({ id, title: p.settings.title, route: p.settings.route }))
+  Object.entries(state.blueprint?.pages || {}).map(([id, p]) => ({
+    id, title: p.settings.title, route: p.settings.route, count: p.components.length
+  }))
 );
 
 export function useNoCodeEngine() {
@@ -371,13 +627,24 @@ export function useNoCodeEngine() {
     deploy,
     addPage,
     removePage,
+    duplicatePage,
+    renamePage,
+    reorderPage,
     selectPage,
+    addMenuItem,
+    addMenuChildItem,
+    removeMenuItem,
+    reorderMenuItem,
     addComponent,
     removeComponent,
     duplicateComponent,
-    moveComponent,
-    moveComponentToIndex,
+    moveComponentToTarget,
+    nudgeRow,
+    nudgeCol,
+    setColSpan,
     renameComponent,
+    copyComponent,
+    pasteComponent,
     undo,
     redo,
     exportJson,

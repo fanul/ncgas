@@ -22,7 +22,8 @@ function builderApi(action, payloadJson) {
     loadApp: function () { return Storage_.loadApp(required_(payload, 'appId')); },
     deleteApp: function () { return Storage_.deleteApp(required_(payload, 'appId')); },
     saveApp: function () { return Storage_.saveApp(unpackBlueprint_(payload)); },
-    compileAndDeploy: function () { return Compiler_.compileAndDeploy(required_(payload, 'appId')); }
+    compileAndDeploy: function () { return Compiler_.compileAndDeploy(required_(payload, 'appId')); },
+    inspectSheet: function () { return SheetInspect_.inspect(required_(payload, 'spreadsheetId')); }
   };
 
   if (!handlers[action]) {

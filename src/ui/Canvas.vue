@@ -1,8 +1,20 @@
 <script setup>
 /**
- * Design canvas. Renders the current page through the SAME runtime renderer
- * that compiled apps use (design hooks add selection/ghosting), so what you
- * see here is what deploys. Handles palette drops + reorder drops.
+ * Design canvas — explicit row/col grid editor.
+ *
+ * Rendering flows through Runtime.renderComponent (same fn compiled apps use)
+ * wrapped in a tiny functional component, so canvas === production output;
+ * everything else here (row bands, drop zones, per-cell toolbar) is editor
+ * chrome layered around it.
+ *
+ * Drag-and-drop uses per-zone handlers bound fresh on every render (via v-for
+ * over the current `rows` computed) instead of one canvas-wide handler doing
+ * stale bounding-rect math — that was the root cause of "drag only works
+ * once": index math computed against DOM nodes that had already changed by
+ * the time the next dragover fired. Each zone here always knows its own
+ * target from the current render pass, and dropTarget is unconditionally
+ * cleared in a finally block plus on dragend/dragleave-from-canvas, so no
+ * gesture can leave stale state behind for the next one.
  */
 import { computed, ref, shallowRef, watch, h } from 'vue';
 import { Runtime } from '../engine.js';
@@ -10,14 +22,17 @@ import { useNoCodeEngine } from '../store/useNoCodeEngine.js';
 
 const engine = useNoCodeEngine();
 const { state } = engine;
-const dropIndex = ref(null); // insertion indicator position
+
+/** Functional wrapper: embeds Runtime.renderComponent's vnode inside the template tree. */
+function RuntimeCell(props) {
+  return Runtime.renderComponent(props.ctx, props.comp);
+}
+RuntimeCell.props = ['ctx', 'comp'];
 
 /**
- * Design-mode runtime context. Built inside a watch callback — NOT a computed —
- * because Runtime.createStore both reads the blueprint deeply and writes into a
- * fresh reactive store; doing that inside a tracked computed makes every render
- * invalidate it again (infinite re-render). The watch re-runs only on explicit
- * triggers: structure edits (previewNonce), page switch, app switch.
+ * Design-mode runtime context, rebuilt in a watch (NOT a computed) — see
+ * Preview.vue for why: Runtime.createStore writes into fresh reactive state,
+ * which would make a tracked computed invalidate itself every render.
  */
 const designCtx = shallowRef(null);
 watch(
@@ -42,103 +57,108 @@ watch(
 );
 
 const page = computed(() => state.blueprint?.pages?.[state.currentPageId]);
+const rows = computed(() => (page.value ? Runtime.groupByRow(page.value.components) : []));
 
-const PageVNodes = {
-  setup() {
-    return () => {
-      const ctx = designCtx.value;
-      const p = page.value;
-      if (!ctx || !p) return h('div');
-      const cols = p.layout?.config?.columns || 12;
-      const comps = p.components || [];
-      const children = comps.map((comp, i) =>
-        h('div', {
-          key: comp.id,
-          class: 'ed-cellwrap' + (dropIndex.value === i ? ' is-drop-target' : ''),
-          'data-cell-index': i,
-          style: cellSpan(comp, cols)
-        }, [Runtime.renderComponent(ctx, comp, cols)])
-      );
-      // trailing full-width strip = "drop at end" target indicator
-      children.push(h('div', {
-        class: 'ed-dropend' + (dropIndex.value === comps.length ? ' is-drop-target' : ''),
-        key: 'drop-end'
-      }));
-      return h('div', {
-        class: 'nc-page ed-grid',
-        style: {
-          display: 'grid',
-          gridTemplateColumns: `repeat(${cols}, 1fr)`,
-          rowGap: '6px',
-          columnGap: p.layout?.config?.colGap || '16px',
-          maxWidth: p.layout?.config?.maxWidth || '1080px'
-        }
-      }, children);
-    };
-  }
-};
-
-function cellSpan(comp, cols) {
-  const span = comp.layoutGrid?.md || comp.layoutGrid?.xs || cols;
-  return { gridColumn: `span ${Math.min(span, cols)}` };
+function cellStyle(comp) {
+  const { col, colSpan } = comp.layoutGrid;
+  return { gridColumn: `${col} / span ${colSpan}` };
 }
 
 // ------------------------------------------------------------------- DnD ----
 
-function computeDropIndex(e) {
-  const cells = [...e.currentTarget.querySelectorAll('[data-cell-index]')];
-  for (const cell of cells) {
-    const rect = cell.getBoundingClientRect();
-    if (e.clientY < rect.top + rect.height / 2) {
-      return Number(cell.dataset.cellIndex);
-    }
+const dropTarget = ref(null); // { mode: 'row'|'newRowBefore'|'newRowEnd', row? }
+
+function sameTarget(a, b) {
+  if (!a || !b) return a === b;
+  return a.mode === b.mode && a.row === b.row;
+}
+function isActive(target) {
+  return sameTarget(dropTarget.value, target);
+}
+function onZoneDragOver(target) {
+  dropTarget.value = target;
+}
+function onCanvasDragLeave(e) {
+  if (!e.currentTarget.contains(e.relatedTarget)) dropTarget.value = null;
+}
+function onDragEnd() {
+  dropTarget.value = null;
+}
+
+function onZoneDrop(target, e) {
+  try {
+    const newType = e.dataTransfer.getData('ncgas/component-type');
+    const moveId = e.dataTransfer.getData('ncgas/move-id');
+    if (newType) engine.addComponent(newType, target);
+    else if (moveId) engine.moveComponentToTarget(moveId, target);
+  } finally {
+    dropTarget.value = null;
   }
-  return page.value?.components.length ?? 0;
 }
 
-function onDragOver(e) {
-  const types = e.dataTransfer.types;
-  if (types.includes('ncgas/component-type') || types.includes('ncgas/move-id')) {
-    e.preventDefault();
-    dropIndex.value = computeDropIndex(e);
-  }
-}
-
-function onDrop(e) {
-  e.preventDefault();
-  const at = dropIndex.value ?? page.value.components.length;
-  dropIndex.value = null;
-  const newType = e.dataTransfer.getData('ncgas/component-type');
-  const moveId = e.dataTransfer.getData('ncgas/move-id');
-  if (newType) engine.addComponent(newType, at);
-  else if (moveId) engine.moveComponentToIndex(moveId, at);
-}
-
-// drag-to-reorder: initiated from the selected cell's tag via mousedown+drag
-function onCellDragStart(e) {
-  const cell = e.target.closest('[data-comp-id]');
-  if (!cell) return;
-  e.dataTransfer.setData('ncgas/move-id', cell.dataset.compId);
+function onCellDragStart(e, compId) {
+  e.dataTransfer.setData('ncgas/move-id', compId);
   e.dataTransfer.effectAllowed = 'move';
 }
 </script>
 
 <template>
-  <section
-    class="ed-canvas"
-    @click="state.selectedId = null"
-    @dragover="onDragOver"
-    @dragleave="dropIndex = null"
-    @drop="onDrop"
-    @dragstart="onCellDragStart"
-  >
+  <section class="ed-canvas" @click="state.selectedId = null" @dragleave="onCanvasDragLeave" @dragend="onDragEnd">
     <div class="ed-canvas-head">
       <span class="ed-canvas-route">{{ page?.settings.route }}</span>
-      <span class="ed-canvas-note">mode desain — komponen dapat diklik & di-drag</span>
+      <span class="ed-canvas-note">mode desain — drag, atau pakai tombol ⠿ ⧉ × dan panah ▲▼◀▶</span>
     </div>
+
     <div v-if="page && !page.components.length" class="ed-canvas-empty">
-      Halaman kosong. Drag komponen dari panel kiri ke sini.
+      Halaman kosong. Drag komponen dari panel kiri ke sini, atau klik salah satu di palet.
     </div>
-    <component :is="PageVNodes" />
+
+    <div v-if="page" class="ed-rows">
+      <template v-for="rowGroup in rows" :key="'row-' + rowGroup.row">
+        <div
+          class="ed-rowgap"
+          :class="{ 'is-drop-target': isActive({ mode: 'newRowBefore', row: rowGroup.row }) }"
+          @dragover.prevent="onZoneDragOver({ mode: 'newRowBefore', row: rowGroup.row })"
+          @drop.prevent="onZoneDrop({ mode: 'newRowBefore', row: rowGroup.row }, $event)"
+        ><span class="ed-rowgap-hint">baris baru di sini</span></div>
+
+        <div
+          class="ed-rowband"
+          :class="{ 'is-drop-target': isActive({ mode: 'row', row: rowGroup.row }) }"
+          @dragover.prevent="onZoneDragOver({ mode: 'row', row: rowGroup.row })"
+          @drop.prevent="onZoneDrop({ mode: 'row', row: rowGroup.row }, $event)"
+        >
+          <div class="ed-rowlabel">Baris {{ rowGroup.row }}</div>
+          <div class="ed-rowgrid">
+            <div
+              v-for="comp in rowGroup.items" :key="comp.id"
+              class="ed-cellwrap"
+              :class="{ 'is-selected': state.selectedId === comp.id }"
+              :style="cellStyle(comp)"
+              @click.stop="state.selectedId = comp.id"
+            >
+              <div class="ed-celltoolbar">
+                <button class="ed-celltool" draggable="true" title="geser (drag)"
+                        @click.stop @dragstart="onCellDragStart($event, comp.id)">⠿</button>
+                <button class="ed-celltool" title="geser kiri" @click.stop="engine.nudgeCol(comp.id, -1)">◀</button>
+                <button class="ed-celltool" title="pindah ke baris atas" @click.stop="engine.nudgeRow(comp.id, -1)">▲</button>
+                <button class="ed-celltool" title="pindah ke baris bawah" @click.stop="engine.nudgeRow(comp.id, 1)">▼</button>
+                <button class="ed-celltool" title="geser kanan" @click.stop="engine.nudgeCol(comp.id, 1)">▶</button>
+                <button class="ed-celltool" title="duplikat" @click.stop="engine.duplicateComponent(comp.id)">⧉</button>
+                <button class="ed-celltool is-danger" title="hapus" @click.stop="engine.removeComponent(comp.id)">×</button>
+              </div>
+              <RuntimeCell v-if="designCtx" :ctx="designCtx" :comp="comp" />
+            </div>
+          </div>
+        </div>
+      </template>
+
+      <div
+        class="ed-rowgap ed-rowgap-end"
+        :class="{ 'is-drop-target': isActive({ mode: 'newRowEnd' }) }"
+        @dragover.prevent="onZoneDragOver({ mode: 'newRowEnd' })"
+        @drop.prevent="onZoneDrop({ mode: 'newRowEnd' }, $event)"
+      ><span class="ed-rowgap-hint">+ tambah baris di akhir (drop di sini)</span></div>
+    </div>
   </section>
 </template>

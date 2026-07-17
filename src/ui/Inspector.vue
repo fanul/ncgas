@@ -10,6 +10,7 @@ import { useNoCodeEngine } from '../store/useNoCodeEngine.js';
 import { REGISTRY } from './registry.js';
 import { FIELD_KINDS, FieldExpression, FieldText, FieldBoolean, FieldSelect, FieldJson } from './fields.js';
 import { Blueprint } from '../engine.js';
+import CrudWizard from './CrudWizard.vue';
 
 const engine = useNoCodeEngine();
 const { state } = engine;
@@ -151,10 +152,8 @@ function applyRename() {
       <div class="ed-panel-title ed-insp-head">
         <span>{{ def.label }}</span>
         <span class="ed-insp-actions">
-          <button class="ed-btn-icon" title="naik" @click="engine.moveComponent(comp.id, -1)">↑</button>
-          <button class="ed-btn-icon" title="turun" @click="engine.moveComponent(comp.id, 1)">↓</button>
-          <button class="ed-btn-icon" title="duplikat" @click="engine.duplicateComponent(comp.id)">⧉</button>
-          <button class="ed-btn-icon is-danger" title="hapus" @click="engine.removeComponent(comp.id)">🗑</button>
+          <button class="ed-btn-icon" title="duplikat (Ctrl+D)" @click="engine.duplicateComponent(comp.id)">⧉</button>
+          <button class="ed-btn-icon is-danger" title="hapus (Del)" @click="engine.removeComponent(comp.id)">🗑</button>
         </span>
       </div>
 
@@ -177,19 +176,29 @@ function applyRename() {
         </div>
       </div>
 
+      <CrudWizard v-if="def.custom === 'crud'" :comp="comp" />
+
       <div class="ed-section">
-        <div class="ed-section-title">Layout (grid 12 kolom)</div>
-        <div class="ed-row2">
-          <div class="ed-field">
-            <label class="ed-field-label">Lebar desktop (md)</label>
-            <input class="ed-input" type="number" min="1" max="12" :value="comp.layoutGrid?.md ?? 12"
-                   @input="setPath(comp, 'layoutGrid.md', Math.max(1, Math.min(12, Number($event.target.value) || 12)))" />
-          </div>
-          <div class="ed-field">
-            <label class="ed-field-label">Lebar mobile (xs)</label>
-            <input class="ed-input" type="number" min="1" max="12" :value="comp.layoutGrid?.xs ?? 12"
-                   @input="setPath(comp, 'layoutGrid.xs', Math.max(1, Math.min(12, Number($event.target.value) || 12)))" />
-          </div>
+        <div class="ed-section-title">Layout (baris {{ comp.layoutGrid.row }}, kolom {{ comp.layoutGrid.col }}–{{ comp.layoutGrid.col + comp.layoutGrid.colSpan - 1 }})</div>
+        <div class="ed-field">
+          <label class="ed-field-label">Lebar (dari 12 kolom)</label>
+          <input class="ed-input" type="number" min="1" max="12" :value="comp.layoutGrid.colSpan"
+                 @input="engine.setColSpan(comp.id, $event.target.value)" />
+        </div>
+        <div class="ed-presets">
+          <button class="ed-btn ed-btn-ghost" @click="engine.setColSpan(comp.id, 12)">Penuh (12)</button>
+          <button class="ed-btn ed-btn-ghost" @click="engine.setColSpan(comp.id, 6)">Setengah (6)</button>
+          <button class="ed-btn ed-btn-ghost" @click="engine.setColSpan(comp.id, 4)">Sepertiga (4)</button>
+          <button class="ed-btn ed-btn-ghost" @click="engine.setColSpan(comp.id, 3)">Seperempat (3)</button>
+        </div>
+        <div class="ed-field-label" style="margin-top:10px">Posisi</div>
+        <div class="ed-nudgepad">
+          <span></span>
+          <button class="ed-btn-icon" title="pindah ke baris atas" @click="engine.nudgeRow(comp.id, -1)">▲</button>
+          <span></span>
+          <button class="ed-btn-icon" title="geser kiri" @click="engine.nudgeCol(comp.id, -1)">◀</button>
+          <button class="ed-btn-icon" title="pindah ke baris bawah" @click="engine.nudgeRow(comp.id, 1)">▼</button>
+          <button class="ed-btn-icon" title="geser kanan" @click="engine.nudgeCol(comp.id, 1)">▶</button>
         </div>
       </div>
 

@@ -81,6 +81,81 @@ function mockDriveSave(db) {
 }
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// ---------------------------------------------------------- mock sheet store --
+// Backs SHEET_READ/APPEND/UPDATE/DELETE in local dev with a real (if fake),
+// persistent CRUD loop — add/edit/delete actually stick — so the whole
+// filter->read->add->edit->delete flow (and master-detail) is fully testable
+// without a real Google Sheet. Keyed by spreadsheetId::sheet, independent of
+// any one service definition, so read/create/update/delete on the "same
+// sheet" always see each other's writes.
+
+const MOCK_SHEETS_KEY = 'ncgas.mocksheets.v1';
+
+function mockSheetsDb() {
+  try { return JSON.parse(localStorage.getItem(MOCK_SHEETS_KEY)) || { tables: {} }; }
+  catch (e) { return { tables: {} }; }
+}
+function mockSheetsSave(db) {
+  localStorage.setItem(MOCK_SHEETS_KEY, JSON.stringify(db));
+}
+function sheetTableKey(service) {
+  return `${service.spreadsheetId || 'local'}::${service.sheet || 'Sheet1'}`;
+}
+function shortId() {
+  return Math.random().toString(36).slice(2, 10);
+}
+
+function mockSheetRead(service) {
+  const db = mockSheetsDb();
+  const key = sheetTableKey(service);
+  if (!db.tables[key]) {
+    db.tables[key] = { rows: Array.isArray(service.mockResult) ? service.mockResult : [] };
+    mockSheetsSave(db);
+  }
+  return db.tables[key].rows;
+}
+
+function mockSheetAppend(service, inputs) {
+  const db = mockSheetsDb();
+  const key = sheetTableKey(service);
+  if (!db.tables[key]) db.tables[key] = { rows: Array.isArray(service.mockResult) ? service.mockResult : [] };
+  const record = { ...inputs };
+  if (service.keyColumn && !record[service.keyColumn]) record[service.keyColumn] = shortId();
+  if (service.dataBoundary && service.dataBoundary.ownerColumn) record[service.dataBoundary.ownerColumn] = MOCK_USER.email;
+  db.tables[key].rows.push(record);
+  mockSheetsSave(db);
+  return { appended: 1, key: record[service.keyColumn] };
+}
+
+function mockSheetUpdate(service, inputs) {
+  const db = mockSheetsDb();
+  const key = sheetTableKey(service);
+  const table = db.tables[key];
+  if (!table) throw new NCGASApiError('NOT_FOUND', `Baris dengan ${service.keyColumn} = ${inputs.key} tidak ditemukan.`);
+  const row = table.rows.find((r) => String(r[service.keyColumn]) === String(inputs.key));
+  if (!row) throw new NCGASApiError('NOT_FOUND', `Baris dengan ${service.keyColumn} = ${inputs.key} tidak ditemukan.`);
+  const record = (inputs.record && typeof inputs.record === 'object') ? inputs.record : {};
+  Object.keys(record).forEach((k) => {
+    if (k === service.keyColumn) return; // identity column never changes via update
+    if (service.dataBoundary && k === service.dataBoundary.ownerColumn) return; // ownership never changes via update
+    row[k] = record[k];
+  });
+  mockSheetsSave(db);
+  return { updated: 1 };
+}
+
+function mockSheetDelete(service, inputs) {
+  const db = mockSheetsDb();
+  const key = sheetTableKey(service);
+  const table = db.tables[key];
+  if (!table) throw new NCGASApiError('NOT_FOUND', `Baris dengan ${service.keyColumn} = ${inputs.key} tidak ditemukan.`);
+  const before = table.rows.length;
+  table.rows = table.rows.filter((r) => String(r[service.keyColumn]) !== String(inputs.key));
+  if (table.rows.length === before) throw new NCGASApiError('NOT_FOUND', `Baris dengan ${service.keyColumn} = ${inputs.key} tidak ditemukan.`);
+  mockSheetsSave(db);
+  return { deleted: 1 };
+}
+
 const mockHandlers = {
   async getIdentity() {
     return { ...MOCK_USER, host: 'local-mock' };
@@ -142,18 +217,34 @@ const mockHandlers = {
 
   /**
    * Preview-mode service execution. The editor preview NEVER hits real
-   * Workspace data: services return their `mockResult` (designed in the
-   * service editor) so builders can safely simulate any dataset.
+   * Workspace data: SHEET_* verbs run against the local mock sheet store
+   * (below) so CRUD actually persists across reloads; everything else
+   * returns the service's configured `mockResult`.
    */
   async runService({ serviceId, inputs, service }) {
-    await delay(250);
-    if (service && service.mockResult !== undefined) return service.mockResult;
-    return {
-      __mock: true,
-      serviceId,
-      inputs,
-      hint: 'Define mockResult on this service to control preview data.'
-    };
+    await delay(150 + Math.random() * 150);
+    if (!service) {
+      return { __mock: true, serviceId, inputs, hint: 'Define mockResult on this service to control preview data.' };
+    }
+    switch (service.type) {
+      case 'SHEET_READ': return mockSheetRead(service);
+      case 'SHEET_APPEND': return mockSheetAppend(service, inputs);
+      case 'SHEET_UPDATE': return mockSheetUpdate(service, inputs);
+      case 'SHEET_DELETE': return mockSheetDelete(service, inputs);
+      // No real Drive locally — just hand back the actual uploaded bytes as a data: URL,
+      // so builders see their real image working in preview (not a placeholder).
+      case 'DRIVE_UPLOAD': return { fileId: 'mock_' + shortId(), url: `data:${inputs.mimeType || 'image/png'};base64,${inputs.base64}` };
+      default: return service.mockResult !== undefined ? service.mockResult : { __mock: true, serviceId, inputs };
+    }
+  },
+
+  /**
+   * Local dev has no real spreadsheet to introspect — the wizard falls back
+   * to manual header entry in this environment (see CrudWizard.vue).
+   */
+  async inspectSheet() {
+    throw new NCGASApiError('UNSUPPORTED',
+      'Deteksi kolom otomatis hanya tersedia saat builder di-hosting di Apps Script. Isi kolom secara manual di bawah.');
   }
 };
 

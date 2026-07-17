@@ -11,16 +11,38 @@ const engine = useNoCodeEngine();
 const { state } = engine;
 
 function onKeydown(e) {
-  const inField = /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName || '');
-  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
+  const inField = /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName || '') || document.activeElement?.isContentEditable;
+  const ctrl = e.ctrlKey || e.metaKey;
+  const key = e.key.toLowerCase();
+
+  if (ctrl && key === 's') {
     e.preventDefault();
     engine.save();
-  } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z' && !inField) {
+  } else if (ctrl && key === 'z' && !inField) {
     e.preventDefault();
     e.shiftKey ? engine.redo() : engine.undo();
-  } else if ((e.key === 'Delete' || e.key === 'Backspace') && !inField && state.selectedId) {
+  } else if (inField) {
+    return; // everything below only applies when not typing in a field
+  } else if ((e.key === 'Delete' || e.key === 'Backspace') && state.selectedId) {
     e.preventDefault();
     engine.removeComponent(state.selectedId);
+  } else if (ctrl && key === 'c' && state.selectedId) {
+    e.preventDefault();
+    engine.copyComponent(state.selectedId);
+  } else if (ctrl && key === 'v') {
+    e.preventDefault();
+    engine.pasteComponent();
+  } else if (ctrl && key === 'd' && state.selectedId) {
+    e.preventDefault();
+    engine.duplicateComponent(state.selectedId);
+  } else if (e.key === 'Escape') {
+    state.selectedId = null;
+  } else if (state.selectedId && e.key.startsWith('Arrow')) {
+    e.preventDefault();
+    if (e.key === 'ArrowUp') engine.nudgeRow(state.selectedId, -1);
+    else if (e.key === 'ArrowDown') engine.nudgeRow(state.selectedId, 1);
+    else if (e.key === 'ArrowLeft') engine.nudgeCol(state.selectedId, -1);
+    else if (e.key === 'ArrowRight') engine.nudgeCol(state.selectedId, 1);
   }
 }
 

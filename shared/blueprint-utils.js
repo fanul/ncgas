@@ -19,8 +19,13 @@
   var SCHEMA_VERSION = 1;
 
   var COMPONENT_EVENTS = ['onClick', 'onChange', 'onBlur', 'onLoad'];
-  var SERVICE_TYPES = ['GAS_RPC', 'SHEET_READ', 'SHEET_APPEND', 'REPORT_EXPORT', 'EMAIL_SEND'];
+  var SERVICE_TYPES = ['GAS_RPC', 'SHEET_READ', 'SHEET_APPEND', 'SHEET_UPDATE', 'SHEET_DELETE', 'REPORT_EXPORT', 'EMAIL_SEND', 'PDF_EXPORT', 'DRIVE_UPLOAD'];
   var LAYOUT_TYPES = ['GRID'];
+  var CRUD_COLUMN_TYPES = ['text', 'number', 'date', 'select', 'rollup', 'computed', 'image'];
+  var CRUD_BADGE_COLORS = ['ok', 'warn', 'err', 'dim'];
+  var MENU_ITEM_TYPES = ['page', 'group', 'link', 'divider'];
+  var CHART_TYPES = ['bar', 'line', 'pie', 'doughnut'];
+  var CRUD_FILTER_TYPES = ['text', 'select'];
 
   var uidCounter = 0;
   function uid(prefix) {
@@ -63,6 +68,7 @@
       },
       sharedServices: {},
       sharedRules: {},
+      menu: [], // ordered nav items {id,type:'page'|'group'|'link'|'divider',...} — empty = auto flat menu from pages
       pages: (function () {
         var pages = {};
         pages[pageId] = createEmptyPage('Home', '/');
@@ -139,8 +145,11 @@
         self.fail(p + '.type', 'Unknown service type `' + svc.type + '`. Allowed: ' + SERVICE_TYPES.join(', '));
       }
       if (svc.type === 'GAS_RPC' && !svc.functionName) self.fail(p + '.functionName', 'GAS_RPC requires functionName');
-      if ((svc.type === 'SHEET_READ' || svc.type === 'SHEET_APPEND') && !svc.spreadsheetId) {
+      if (svc.type && svc.type.indexOf('SHEET_') === 0 && !svc.spreadsheetId) {
         self.fail(p + '.spreadsheetId', svc.type + ' requires spreadsheetId');
+      }
+      if ((svc.type === 'SHEET_UPDATE' || svc.type === 'SHEET_DELETE') && !svc.keyColumn) {
+        self.fail(p + '.keyColumn', svc.type + ' requires keyColumn (the sheet column that uniquely identifies a row)');
       }
       if (svc.allowedRoles && !Array.isArray(svc.allowedRoles)) self.fail(p + '.allowedRoles', 'allowedRoles must be an array');
       if (svc.rules && Array.isArray(svc.rules.execution)) {
@@ -167,6 +176,7 @@
 
     var seenRoutes = {};
     var seenComponentIds = {};
+    var deferredRelatedToChecks = []; // relatedTo.parentComponentId + rollup.fromComponentId refs — resolved after all pages are walked (target may be defined on a later page)
 
     Object.keys(bp.pages).forEach(function (pageId) {
       var page = bp.pages[pageId];
@@ -197,13 +207,141 @@
         }
         if (!comp.type) self.fail(cp + '.type', 'Component type is required');
 
-        if (comp.layoutGrid) {
-          ['xs', 'md'].forEach(function (bpKey) {
-            var span = comp.layoutGrid[bpKey];
-            if (span !== undefined && (typeof span !== 'number' || span < 1 || span > 12)) {
-              self.fail(cp + '.layoutGrid.' + bpKey, 'Grid span must be a number 1..12');
+        // Explicit 2D grid placement: row (1-based, any positive int), col (1-12),
+        // colSpan (1-12), with col+colSpan-1 clamped inside the 12-col grid.
+        // Components sharing a row stack left-to-right by col; rows stack top-to-bottom.
+        if (!isPlainObject(comp.layoutGrid)) {
+          self.fail(cp + '.layoutGrid', 'layoutGrid {row,col,colSpan} is required');
+        } else {
+          var lg = comp.layoutGrid;
+          if (!Number.isInteger(lg.row) || lg.row < 1) self.fail(cp + '.layoutGrid.row', 'row must be a positive integer');
+          if (!Number.isInteger(lg.col) || lg.col < 1 || lg.col > 12) self.fail(cp + '.layoutGrid.col', 'col must be an integer 1..12');
+          if (!Number.isInteger(lg.colSpan) || lg.colSpan < 1 || lg.colSpan > 12) self.fail(cp + '.layoutGrid.colSpan', 'colSpan must be an integer 1..12');
+          if (Number.isInteger(lg.col) && Number.isInteger(lg.colSpan) && lg.col + lg.colSpan - 1 > 12) {
+            self.fail(cp + '.layoutGrid', 'col (' + lg.col + ') + colSpan (' + lg.colSpan + ') overflows the 12-column grid');
+          }
+        }
+
+        // CRUD_TABLE: filter/read/add/edit/delete grid, optionally sheet-backed and/or master-detail linked
+        if (comp.type === 'CRUD_TABLE') {
+          var cprops = comp.properties || {};
+          var pp = cp + '.properties';
+          if (['expression', 'sheet', 'local'].indexOf(cprops.dataSource) === -1) {
+            self.fail(pp + '.dataSource', 'dataSource must be "expression", "sheet" or "local"');
+          }
+          if (cprops.dataSource === 'expression' && !cprops.rowsExpression) {
+            self.fail(pp + '.rowsExpression', 'rowsExpression is required when dataSource is "expression"');
+          }
+          if (cprops.dataSource === 'sheet') {
+            if (!cprops.keyColumn) self.fail(pp + '.keyColumn', 'keyColumn is required when dataSource is "sheet"');
+            ['serviceRead', 'serviceCreate', 'serviceUpdate', 'serviceDelete'].forEach(function (key) {
+              if (cprops[key] && !services[cprops[key]]) {
+                self.fail(pp + '.' + key, 'Broken reference: service `' + cprops[key] + '` is not defined in sharedServices');
+              }
+            });
+          }
+          if (cprops.dataSource === 'local' && !cprops.localKey) {
+            self.fail(pp + '.localKey', 'localKey (the state.* key holding the array) is required when dataSource is "local"');
+          }
+          if (!Array.isArray(cprops.columns) || !cprops.columns.length) {
+            self.fail(pp + '.columns', 'At least one column is required');
+          } else {
+            var seenColKeys = {};
+            cprops.columns.forEach(function (col, ci) {
+              var colp = pp + '.columns[' + ci + ']';
+              if (!col.key) self.fail(colp + '.key', 'Column key is required');
+              else if (seenColKeys[col.key]) self.fail(colp + '.key', 'Duplicate column key `' + col.key + '`');
+              else seenColKeys[col.key] = true;
+              if (col.type && CRUD_COLUMN_TYPES.indexOf(col.type) === -1) {
+                self.fail(colp + '.type', 'Column type must be one of: ' + CRUD_COLUMN_TYPES.join(', '));
+              }
+              if (col.type === 'rollup') {
+                var ru = col.rollup;
+                if (!isPlainObject(ru) || !ru.fromComponentId || !ru.matchColumn || !ru.statusColumn || !ru.doneValue) {
+                  self.fail(colp + '.rollup', 'rollup needs fromComponentId, matchColumn, statusColumn and doneValue');
+                } else {
+                  deferredRelatedToChecks.push({ path: colp + '.rollup.fromComponentId', parentComponentId: ru.fromComponentId, childId: comp.id });
+                  ['doneColor', 'pendingColor', 'emptyColor'].forEach(function (k) {
+                    if (ru[k] && CRUD_BADGE_COLORS.indexOf(ru[k]) === -1) {
+                      self.fail(colp + '.rollup.' + k, k + ' must be one of: ' + CRUD_BADGE_COLORS.join(', '));
+                    }
+                  });
+                }
+              }
+              if (col.type === 'computed') {
+                self.checkExpr(colp + '.valueExpression', col.valueExpression);
+              }
+              if (col.type === 'image' && col.uploadService) {
+                if (!services[col.uploadService]) {
+                  self.fail(colp + '.uploadService', 'Broken reference: service `' + col.uploadService + '` is not defined in sharedServices');
+                } else if (services[col.uploadService].type !== 'DRIVE_UPLOAD') {
+                  self.fail(colp + '.uploadService', 'uploadService must reference a DRIVE_UPLOAD service');
+                }
+              }
+            });
+          }
+          if (cprops.filters) {
+            if (!Array.isArray(cprops.filters)) self.fail(pp + '.filters', 'filters must be an array');
+            else cprops.filters.forEach(function (f, fi) {
+              if (f.type && CRUD_FILTER_TYPES.indexOf(f.type) === -1) {
+                self.fail(pp + '.filters[' + fi + '].type', 'Filter type must be one of: ' + CRUD_FILTER_TYPES.join(', '));
+              }
+            });
+          }
+          if (cprops.relatedTo) {
+            var rel = cprops.relatedTo;
+            if (!rel.parentComponentId || !rel.parentKeyColumn || !rel.childForeignKeyColumn) {
+              self.fail(pp + '.relatedTo', 'relatedTo needs parentComponentId, parentKeyColumn and childForeignKeyColumn');
+            } else {
+              deferredRelatedToChecks.push({ path: pp + '.relatedTo.parentComponentId', parentComponentId: rel.parentComponentId, childId: comp.id });
             }
-          });
+          }
+        }
+
+        // CHART: bar/line/pie/doughnut fed by two parallel-array expressions.
+        if (comp.type === 'CHART') {
+          var chp = comp.properties || {};
+          var chpp = cp + '.properties';
+          if (CHART_TYPES.indexOf(chp.chartType) === -1) {
+            self.fail(chpp + '.chartType', 'chartType must be one of: ' + CHART_TYPES.join(', '));
+          }
+          self.checkExpr(chpp + '.labelsExpression', chp.labelsExpression);
+          self.checkExpr(chpp + '.valuesExpression', chp.valuesExpression);
+        }
+
+        // FORM_IMAGE_UPLOAD: uploads to Drive via a DRIVE_UPLOAD service, stores the
+        // returned serving URL as this component's value.
+        if (comp.type === 'FORM_IMAGE_UPLOAD') {
+          var fip = comp.properties || {};
+          var fipp = cp + '.properties';
+          if (!fip.uploadService) {
+            self.fail(fipp + '.uploadService', 'uploadService is required');
+          } else if (!services[fip.uploadService]) {
+            self.fail(fipp + '.uploadService', 'Broken reference: service `' + fip.uploadService + '` is not defined in sharedServices');
+          } else if (services[fip.uploadService].type !== 'DRIVE_UPLOAD') {
+            self.fail(fipp + '.uploadService', 'uploadService must reference a DRIVE_UPLOAD service (got `' + services[fip.uploadService].type + '`)');
+          }
+        }
+
+        // PRINT_BUTTON: opens a print-friendly view rendered from an HTML template whose
+        // {{...}} tokens are full expressions (escaped on output) — see runtime-core.js.
+        if (comp.type === 'PRINT_BUTTON') {
+          var pbp = comp.properties || {};
+          var ppp = cp + '.properties';
+          if (!pbp.htmlTemplate || typeof pbp.htmlTemplate !== 'string') {
+            self.fail(ppp + '.htmlTemplate', 'htmlTemplate is required');
+          } else {
+            var tokenRe = /\{\{\s*([^}]+?)\s*\}\}/g;
+            var tm;
+            while ((tm = tokenRe.exec(pbp.htmlTemplate)) !== null) {
+              if (tm[1] === 'items_table') continue; // reserved marker, not an expression
+              self.checkExpr(ppp + '.htmlTemplate[{{' + tm[1] + '}}]', tm[1]);
+            }
+          }
+          if (pbp.itemsExpression) self.checkExpr(ppp + '.itemsExpression', pbp.itemsExpression);
+          if (pbp.pdfExportService && !services[pbp.pdfExportService]) {
+            self.fail(ppp + '.pdfExportService', 'Broken reference: service `' + pbp.pdfExportService + '` is not defined in sharedServices');
+          }
         }
 
         // services: event -> { action, inputs }
@@ -249,10 +387,73 @@
       });
     });
 
+    deferredRelatedToChecks.forEach(function (check) {
+      if (!seenComponentIds[check.parentComponentId]) {
+        self.fail(check.path, 'Broken reference: parent component `' + check.parentComponentId + '` does not exist (referenced by ' + check.childId + ')');
+      } else if (check.parentComponentId === check.childId) {
+        self.fail(check.path, 'A CRUD_TABLE cannot be related to itself');
+      }
+    });
+
     var home = bp.meta && bp.meta.globalSettings && bp.meta.globalSettings.homePage;
     if (home && !bp.pages[home]) this.fail('meta.globalSettings.homePage', 'homePage points to missing page `' + home + '`');
 
+    // menu: ordered nav tree — empty/absent means the runtime synthesizes a flat menu from bp.pages
+    if (bp.menu !== undefined) {
+      if (!Array.isArray(bp.menu)) {
+        this.fail('menu', 'menu must be an array');
+      } else {
+        var seenMenuIds = {};
+        bp.menu.forEach(function (item, i) {
+          self.validateMenuItem(item, 'menu[' + i + ']', seenMenuIds, true);
+        });
+      }
+    }
+
     return this.errors;
+  };
+
+  Validator.prototype.validateMenuItem = function (item, path, seenMenuIds, allowGroup) {
+    var self = this;
+    if (!isPlainObject(item)) { this.fail(path, 'Menu item must be an object'); return; }
+    if (!item.id || !/^mi_[a-z0-9_]+$/.test(item.id)) {
+      this.fail(path + '.id', 'Menu item ids must match mi_[a-z0-9_]+');
+    } else if (seenMenuIds[item.id]) {
+      this.fail(path + '.id', 'Duplicate menu item id `' + item.id + '`');
+    } else {
+      seenMenuIds[item.id] = true;
+    }
+
+    var types = allowGroup ? MENU_ITEM_TYPES : MENU_ITEM_TYPES.filter(function (t) { return t !== 'group'; });
+    if (types.indexOf(item.type) === -1) {
+      this.fail(path + '.type', 'Menu item type must be one of: ' + types.join(', ') + (allowGroup ? '' : ' (groups cannot be nested)'));
+      return;
+    }
+
+    if (item.type === 'page') {
+      if (!item.pageId || !this.bp.pages[item.pageId]) {
+        this.fail(path + '.pageId', 'Broken reference: page `' + item.pageId + '` does not exist');
+      }
+    } else if (item.type === 'link') {
+      if (!item.url || typeof item.url !== 'string') this.fail(path + '.url', 'link items require a url');
+    } else if (item.type === 'group') {
+      if (!Array.isArray(item.children) || !item.children.length) {
+        this.fail(path + '.children', 'group items require at least one child');
+      } else {
+        item.children.forEach(function (child, ci) {
+          self.validateMenuItem(child, path + '.children[' + ci + ']', seenMenuIds, false);
+        });
+      }
+    }
+
+    if (item.type !== 'divider' && item.allowedRoles !== undefined) {
+      if (!Array.isArray(item.allowedRoles)) this.fail(path + '.allowedRoles', 'allowedRoles must be an array');
+      else item.allowedRoles.forEach(function (role) {
+        if (self.bp.rbac && Array.isArray(self.bp.rbac.roles) && self.bp.rbac.roles.indexOf(role) === -1) {
+          self.fail(path + '.allowedRoles', 'Unknown role `' + role + '` (declare it in rbac.roles)');
+        }
+      });
+    }
   };
 
   /** -> { ok: boolean, errors: [{path, message}] } */
@@ -291,7 +492,8 @@
       globals: {
         rbac: deepClone(bp.rbac || {}),
         sharedServices: deepClone(bp.sharedServices || {}),
-        sharedRules: deepClone(bp.sharedRules || {})
+        sharedRules: deepClone(bp.sharedRules || {}),
+        menu: deepClone(bp.menu || [])
       },
       pages: pages
     };
@@ -315,6 +517,7 @@
       rbac: globals.rbac || { roleMap: { '*': ['Employee'] }, roles: ['Employee'] },
       sharedServices: globals.sharedServices || {},
       sharedRules: globals.sharedRules || {},
+      menu: globals.menu || [],
       pages: pages,
       deploy: manifest.deploy || {}
     };

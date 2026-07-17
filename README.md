@@ -37,6 +37,13 @@ Script web app with one click.
 4. **Design-mode = production renderer.** The canvas renders through the exact runtime
    that ships to users (with selection affordances layered on). WYSIWYG is structural,
    not approximate.
+5. **Explicit row/col grid, one reflow function.** Every component carries `layoutGrid
+   {row, col, colSpan}`. Drag, keyboard nudge (arrow keys / ▲▼◀▶ buttons), duplicate and
+   paste all resolve through a handful of placement primitives in
+   `useNoCodeEngine.js` that funnel into a single `reflowPage()` — it derives final
+   row/col purely from each component's row value (transiently fractional, e.g. `1.5`,
+   to mean "insert a row between 1 and 2") and its position in the page's component
+   array. One code path to get right, instead of one per gesture.
 
 ## Blueprint contract (AST)
 
@@ -68,7 +75,7 @@ Script web app with one click.
       "layout": { "type": "GRID", "config": { "columns": 12, "rowGap": "16px", "colGap": "16px" } },
       "components": [{
         "id": "comp_input_salary", "type": "FORM_INPUT_NUMBER",
-        "layoutGrid": { "xs": 12, "md": 6 },
+        "layoutGrid": { "row": 1, "col": 1, "colSpan": 6 },
         "properties": { "label": "Base Salary", "defaultValue": 0 },
         "services": { "onBlur": { "action": "srv_fetch_employees", "resultKey": "employees",
                                    "validateFirst": false, "inputs": { "salary": "comp_input_salary.value" } } },
@@ -83,8 +90,120 @@ Script web app with one click.
 }
 ```
 
-Component types: `HEADING TEXT KPI_CARD DIVIDER FORM_INPUT_TEXT FORM_INPUT_NUMBER
-FORM_INPUT_DATE FORM_SELECT FORM_CHECKBOX BUTTON DATA_TABLE`.
+Component types: `HEADING TEXT KPI_CARD CHART DIVIDER FORM_INPUT_TEXT FORM_INPUT_NUMBER
+FORM_INPUT_DATE FORM_SELECT FORM_IMAGE_UPLOAD FORM_CHECKBOX BUTTON PRINT_BUTTON
+DATA_TABLE CRUD_TABLE`.
+
+## CRUD_TABLE — filter → read → add → edit → delete
+
+`DATA_TABLE` is display-only (an expression that renders as a table). `CRUD_TABLE` is
+the full admin-grid pattern: search + per-column filters, a "+ Tambah" button opening a
+modal form auto-generated from `properties.columns`, and ✎/🗑 row actions (delete asks
+"Yakin?" inline, no browser popup). Drop one in the builder, set *Sumber Data: Google
+Sheet*, and the wizard walks you through the rest.
+
+**Data source.** `properties.dataSource` is `'sheet'` (the CRUD path) or `'expression'`
+(same read-only behavior as `DATA_TABLE`, kept for computed/derived tables). In sheet
+mode, `properties.keyColumn` names the column that uniquely identifies a row, and
+`serviceRead/Create/Update/Delete` point at four `sharedServices` entries — one each of
+`SHEET_READ`, `SHEET_APPEND`, `SHEET_UPDATE`, `SHEET_DELETE` — that the Inspector's
+**⚡ Buat Layanan CRUD** button generates for you from the spreadsheetId/sheet/keyColumn
+you configured. `SHEET_UPDATE`/`SHEET_DELETE` locate the row by `keyColumn`, enforce the
+same `dataBoundary` ownership check as every other sheet service (fail-closed), and never
+let the identity or ownership column itself change via update.
+
+**Discovering columns.** Hosted on Apps Script, **🔌 Tes Koneksi** opens the spreadsheet
+as *your own* identity (`spreadsheets.readonly`, `executeAs: USER_ACCESSING` — never a
+shared service account) and reads real header rows, so you pick columns from what's
+actually in the sheet. Local dev has no real spreadsheet to probe, so the wizard falls
+back to typing header names manually — same resulting schema either way.
+
+**Master-detail ("add detail" pattern).** Any `CRUD_TABLE` can declare
+`properties.relatedTo = {parentComponentId, parentKeyColumn, childForeignKeyColumn}`.
+Clicking a row on the parent table sets its `selectedRowKey`; every related child table
+(anywhere in the app — runtime state persists across page navigation) automatically
+scopes its rows to that key and pre-fills the foreign key on new "detail" records as a
+locked field. This is the Orders → Order Items / Proyek → Tugas pattern — see the
+"Manajemen Data" page in the Employee Dashboard template for a working example.
+
+**Local dev CRUD.** Preview mode never touches real Workspace data (same rule as every
+other service), but `SHEET_READ/APPEND/UPDATE/DELETE` in local dev run against a real,
+persistent fake sheet store in `localStorage` (`src/rpc/adapter.js`) — add/edit/delete
+actually stick across reloads, so the whole flow (and master-detail) is genuinely
+testable before you ever touch a real Google Sheet.
+
+**Rollup columns (computed status from child data).** A column can be
+`type: 'rollup'` instead of text/number/date/select:
+`{fromComponentId, matchColumn, statusColumn, doneValue, doneLabel, doneColor, pendingLabel, pendingColor, emptyLabel, emptyColor}`
+(colors: `ok`/`warn`/`err`/`dim`). The runtime looks at another `CRUD_TABLE`'s
+already-loaded rows, matches them to the current row, and renders a colored badge — green
+once every matching child's status equals `doneValue`, amber otherwise, gray if there are
+none yet. Purely a read of trusted runtime state (not a user expression), configured via
+the Inspector's column type picker. The child table needs to have been loaded at least
+once — normally just "present on the same page" — or the badge falls back to "empty".
+
+## Building POS-style apps (cart, receipts, dashboards, product photos)
+
+The "Kasir POS" page in the Employee Dashboard template exercises all four of these
+together, end to end. See it for a working reference.
+
+**Live sums / cart.** `CRUD_TABLE` supports a third `dataSource: 'local'` — rows live in
+`state.{localKey}` (a plain array, e.g. `state.cart`) instead of a Sheet, so add/edit/delete
+never leave the browser. Each row gets an internal `_localId` (not a real column) as its
+identity, so `keyColumn` doesn't need to be configured for local tables. Combine with a
+`type: 'computed'` column (`valueExpression` evaluated per-row, with `row` in scope —
+`row.qty * row.harga`) for a live subtotal, and the `sumProduct(rows, keyA, keyB)` builtin
+for the grand total: `formatIDR(sumProduct(state.cart, 'qty', 'harga'))`. `computed`
+columns are never sent to a backend and never shown in the add/edit form.
+
+**Print → receipts.** `PRINT_BUTTON` opens a print-friendly modal rendered from
+`properties.htmlTemplate`. Every `{{...}}` is a *full expression* (not just a dotted key
+path) — evaluated with the normal component scope and HTML-escaped before substitution,
+same trust model as `EMAIL_SEND`'s template (builder-authored structure, escaped data —
+see the security note atop `shared/runtime-core.js`). `{{items_table}}` is a reserved
+marker that substitutes an itemized `<table>` built from `properties.itemsExpression`
+(an array) and `properties.itemColumns`. The "🖨 Cetak" button calls `window.print()`
+scoped to just that receipt via CSS (`@media print` + a "hide everything else" rule) — no
+popup window needed. An optional `pdfExportService` (a `PDF_EXPORT` service) adds a
+"💾 Simpan PDF" button that converts the rendered HTML to a PDF in Drive
+(`Utilities.newBlob(html,'text/html').getAs('application/pdf')` — basic fidelity, fine for
+receipts/simple reports, not pixel-perfect layouts).
+
+**Dashboards.** `CHART` (bar/line/pie/doughnut, backed by Chart.js loaded from CDN in both
+the editor and compiled apps) takes two parallel-array expressions —
+`labelsExpression`/`valuesExpression` — so it composes with everything else instead of
+needing its own query builder: `pluck(groupBySum(state.sales, 'kategori', 'total'), 'key')`
+/ `pluck(groupBySum(state.sales, 'kategori', 'total'), 'total')`. `groupBySum(rows,
+groupKey, valueKey)` and `groupByCount(rows, groupKey)` are native, non-lambda aggregation
+builtins (same security posture as `whereEquals`). A "dashboard" is just a page combining
+`CHART` + `KPI_CARD` + `CRUD_TABLE` filters — no separate dashboard-builder mode.
+
+**Product photos (Drive upload).** `FORM_IMAGE_UPLOAD` (and `CRUD_TABLE` columns with
+`type: 'image'`) upload a file (base64 over `google.script.run`, since GAS can't do
+multipart uploads) via a `DRIVE_UPLOAD` service. Uploaded files are **not** made public —
+they stay owner-private in Drive, and are served back through the deployed app's own
+`doGet` (`?action=ncgas_image&fileId=...`, in `Tpl_ServerMain.html`/`NcServeImage_`), which
+re-checks identity on every request exactly like every other route. This means access is
+governed by the app's own auth, not by Drive sharing settings. Local dev has no real Drive
+to write to, so the mock adapter hands back the actual uploaded bytes as a `data:` URL —
+you see your real image working in preview, not a placeholder.
+⚠️ *The `doGet` image-serving route is GAS-runtime-only behavior that can't be executed in
+this local/Node environment — verify it once on a real deployment before relying on it.*
+
+## Menu management (sidebar navigation)
+
+Deployed apps use a slim top header + left sidebar shell (`RuntimeApp` in
+`shared/runtime-core.js`), not a flat topbar. `bp.menu` is an ordered nav tree — empty or
+absent (the default for every existing/older blueprint) means the sidebar auto-lists every
+page, so this is purely opt-in.
+
+Item types: `page` (navigates, `pageId` must exist), `group` (an expand/collapse section
+holding `page`/`link`/`divider` children — **one level of nesting only**, groups cannot
+contain groups), `link` (opens `url` in a new tab), `divider` (visual separator). Every
+type except `divider` accepts an `allowedRoles` array, checked the same way as
+`page.settings.allowedRoles`. Configure it from the Palette's **Menu** tab
+(`MenuManager.vue`) — add/reorder/remove at the top level or inside a group; label, icon
+(any emoji), page/url and roles are edited inline.
 
 ## Expression language (safe subset)
 
@@ -93,14 +212,25 @@ component's `{value,error,touched,loading}`), any `comp_*` id, `env`. On the ser
 service rules see `payload`, `user`, `env`.
 
 Operators: `+ - * / %`, `== != === !==` (**`==` is strict**), `< <= > >=`, `&& || ?? !`,
-ternary `?:`, `[index]`, `.member`, array literals. Functions: `abs round floor ceil
-min max sum avg count pluck len lower upper trim concat includes startsWith endsWith
-split join number string boolean coalesce iif isEmpty formatNumber formatIDR now today`.
+ternary `?:`, `[index]`, `.member`, array literals `[1,2,3]`, object literals `{a:1,b:2}`.
+Functions: `abs round floor ceil min max sum avg count pluck whereEquals groupBySum
+groupByCount sumProduct len lower upper trim concat includes startsWith endsWith split
+join number string boolean coalesce iif isEmpty formatNumber formatIDR now today`.
 
 Hard security walls: method calls rejected at parse time, `__proto__`/`constructor`/
-`prototype` access rejected, no assignment/statements/lambdas, bounded length/depth/steps.
-Visibility rules **fail closed** in deployed apps (error ⇒ hidden), fail open in the
-canvas so you can click and fix them.
+`prototype` access rejected (as member access **and** as an object-literal key), no
+assignment/statements/lambdas, bounded length/depth/steps. Visibility rules **fail
+closed** in deployed apps (error ⇒ hidden), fail open in the canvas so you can click and
+fix them.
+
+**Dependent dropdowns.** `whereEquals(rows, key, value)` is a declarative, native-code
+filter — the language still has no lambdas, so predicates can't be user-authored, but a
+fixed equality check over a native function is safe. Combined with `pluck` and object/array
+literals, a `FORM_SELECT`'s `optionsExpression` can filter a reference list by another
+component's value: `pluck(whereEquals(state.kota, 'provinsi_id', comp_provinsi.value), 'nama')`.
+Set `properties.dependsOn` to the other component's id and its value auto-clears whenever
+that component changes (cascades through chains, current-page only). Set
+`properties.searchable` for a type-to-filter combobox instead of a native `<select>`.
 
 ## Security model
 
@@ -108,22 +238,28 @@ canvas so you can click and fix them.
 |---|---|
 | Page access | `doGet` strips pages whose `allowedRoles` don't match the caller **server-side**; `rbac.roleMap` never leaves the server |
 | Service access | every `rpcApi` call re-resolves identity (`Session.getActiveUser()`), re-checks `allowedRoles` → `403 FORBIDDEN` envelope |
-| Row-level data | `dataBoundary.ownerColumn`: reads filtered to caller's email (fail-closed if the column is missing), writes force-stamp it |
+| Row-level data | `dataBoundary.ownerColumn`: reads filtered to caller's email (fail-closed if the column is missing), writes force-stamp it; `SHEET_UPDATE`/`SHEET_DELETE` re-check ownership on the located row before touching it |
 | Server rules | `rules.execution` evaluated by the same no-eval engine against `payload`/`user` |
-| Templates | email `{{tokens}}` HTML-escaped; blueprint JSON `</script>`-escaped; renderer never uses innerHTML |
-| Preview | editor preview only ever sees `mockResult` data — never live Workspace data |
+| Templates | email/print `{{tokens}}` are evaluated expressions, HTML-escaped on output; blueprint JSON `</script>`-escaped; the runtime touches innerHTML in exactly one place (PRINT_BUTTON's receipt view) under that same escaped-token discipline — see `shared/runtime-core.js` header |
+| Uploaded files | `DRIVE_UPLOAD` never makes files public — they stay owner-private in Drive and are only readable through the app's own `doGet` image route, which re-checks identity like every other request |
+| Preview | editor preview only ever sees `mockResult` data (or, for uploads, the real file as a local `data:` URL) — never live Workspace data |
 
 ## Getting started (local)
 
 ```bash
 npm install
-npm test        # 26 unit tests: expression engine + blueprint/sharding
-npm run dev     # editor at http://localhost:5173 (mock Drive in localStorage)
+npm test        # unit tests: expression engine + blueprint/sharding + CRUD_TABLE validation
+npm run dev     # editor at http://localhost:5173 (mock Drive + mock sheets in localStorage)
 ```
 
 The editor seeds an **Employee Dashboard** template: switch to *Preview*, toggle the
-simulated roles (Admin / HR_Manager / Employee) and watch RBAC visibility, run the
-mock service, trip the validation rules.
+simulated roles (Admin / HR_Manager / Employee) and watch RBAC visibility, run the mock
+service, trip the validation rules. **Manajemen Data** is a working `CRUD_TABLE` demo — a
+flat Karyawan grid (filter/search/add/edit/delete) plus a Proyek → Tugas master-detail
+pair with a rollup status badge. **Formulir Alamat** demos cascading + searchable
+dropdowns. **Kasir POS** ties everything together — a Sheet-backed product catalog with
+photo uploads, an in-memory cart with a live computed total, a printable receipt, and a
+sales-by-category dashboard chart.
 
 ## Deploying the builder to Apps Script
 
@@ -160,13 +296,14 @@ shared/                 THE product core — env-agnostic, zero-dependency
   base-css.js           nc-* stylesheet shared editor ⇄ deployed apps
 src/                    Vue 3 + Vite visual builder
   store/useNoCodeEngine.js   blueprint state, undo, save/deploy actions
-  rpc/adapter.js        google.script.run ⇄ localStorage mock seam
-  ui/                   Palette / Canvas / Inspector / Preview / registry
+  rpc/adapter.js        google.script.run ⇄ localStorage mock seam (+ mock sheet store)
+  ui/                   Palette / Canvas / Inspector / Preview / registry / CrudWizard / MenuManager
 gas/builder/            Apps Script backend (push with clasp)
   Main.js Api.js        web entry + RPC envelope surface
   Storage.js            Drive sharding + Utilities.gzip
   Compiler.js           Apps Script REST API orchestrator
-  Tpl_ServerMain.html   target app's server runtime (RBAC/boundary/report/email)
+  SheetInspect.js        reads real sheet headers for the CRUD wizard (user's own OAuth)
+  Tpl_ServerMain.html   target app's server runtime (RBAC/boundary/CRUD verbs/report/email)
   Tpl_Index.html        target app's SPA skeleton
 scripts/sync-gas.mjs    materializes shared/ into gas/builder/
 tests/                  node --test suites
@@ -176,11 +313,38 @@ tests/                  node --test suites
 
 - Deployed apps load Vue from jsDelivr; offline domains should mirror the file and
   change the URL in `Tpl_Index.html` before compiling.
-- `xs` grid spans are stored but the runtime currently applies `md` (responsive
-  breakpoints = roadmap).
+- Grid placement is desktop-only for now (no separate mobile breakpoint span —
+  responsive collapsing is roadmap).
 - Component id rename does not rewrite expressions that reference the old id (the
   editor warns; blueprint validation catches dangling service refs but not ids inside
   expressions — roadmap: reference tracker).
 - Property edits are not in the undo stack (structural add/move/delete/duplicate are).
-- Roadmap: SHEET_UPDATE/DELETE services, repeating list/container components,
-  blueprint version migrations, per-page onLoad workflows, richer report designer.
+- `CRUD_TABLE` filtering/search runs client-side over the loaded rows (bounded by
+  `SHEET_READ`'s existing `maxRows`, default 2000) — fine for typical admin datasets,
+  not built for huge sheets. Server-side filter push-down and pagination are roadmap.
+- Master-detail selection (`selectedRowKey`) is single-level: a child can't itself be a
+  parent of a third level in the current UI (the data model would allow it, chaining
+  `relatedTo`, but the wizard doesn't surface deeper nesting yet).
+- Rollup columns require the source child `CRUD_TABLE` to have loaded its rows at least
+  once (normally: present on the same page) — falls back to the "empty" badge otherwise,
+  never throws, but won't reflect data it hasn't seen.
+- `dependsOn` cascading only looks at components on the *current page*; cross-page
+  dependent dropdowns aren't supported yet.
+- Menu groups are one level deep by design (matches the sidebar's actual rendering) —
+  nested groups are rejected by validation, not silently flattened.
+- `dataSource: 'local'` (cart-style CRUD_TABLE) has no state and no seed data — it always
+  starts empty and resets on page reload. There's no `defaultRows`/seeding mechanism yet
+  for a small in-memory catalog that isn't backed by a Sheet.
+- A `CRUD_TABLE`'s own add/edit modal can't show a *dynamic* dropdown sourced from another
+  table's live rows (e.g. "pick a product" inside the cart's add form) — `select` column
+  options are a static list. Workaround used in the POS demo: the cashier reads the price
+  from the visible Produk table and types it into the cart form.
+- `PDF_EXPORT` uses GAS's basic HTML→PDF blob conversion, not a full rendering engine —
+  fine for receipts/simple reports, not pixel-perfect layouts.
+- The `doGet` image-serving route (`NcServeImage_`) is GAS-runtime-only behavior with no
+  local/Node equivalent — every other piece of the image-upload feature was verified live
+  in the browser (upload → preview → save → table thumbnail), but that one route needs
+  verification against a real deployment.
+- Roadmap: repeating list/container components, blueprint version migrations,
+  richer report designer, bulk row actions (multi-select delete/export) on CRUD_TABLE,
+  server-side filter push-down for very large sheets, dynamic options in CRUD modals.

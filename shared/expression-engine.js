@@ -58,7 +58,7 @@
 
   var PUNCT3 = ['===', '!=='];
   var PUNCT2 = ['==', '!=', '<=', '>=', '&&', '||', '??'];
-  var PUNCT1 = ['+', '-', '*', '/', '%', '<', '>', '!', '?', ':', '(', ')', '[', ']', ',', '.'];
+  var PUNCT1 = ['+', '-', '*', '/', '%', '<', '>', '!', '?', ':', '(', ')', '[', ']', ',', '.', '{', '}'];
   var KEYWORDS = { 'true': true, 'false': false, 'null': null };
 
   function tokenize(src) {
@@ -283,6 +283,26 @@
         this.expect(']');
         return { t: 'array', items: items, pos: t.pos };
       }
+      if (t.value === '{') {
+        var pairs = [];
+        if (!(this.peek().type === 'punct' && this.peek().value === '}')) {
+          for (;;) {
+            var keyTok = this.next();
+            var key;
+            if (keyTok.type === 'ident' || keyTok.type === 'str') key = String(keyTok.value);
+            else throw ExpressionError('SYNTAX', 'Expected a property name in object literal', keyTok.pos, this.src);
+            if (isDeniedKey(key)) throw ExpressionError('SECURITY', 'Object literal key `' + key + '` is forbidden', keyTok.pos, this.src);
+            this.expect(':');
+            var value = this.parseExpression(0, depth + 1);
+            pairs.push({ key: key, value: value });
+            var sep2 = this.peek();
+            if (sep2.type === 'punct' && sep2.value === ',') { this.next(); continue; }
+            break;
+          }
+        }
+        this.expect('}');
+        return { t: 'object', pairs: pairs, pos: t.pos };
+      }
       if (t.value === '!' || t.value === '-' || t.value === '+') {
         var operand = this.parseExpression(UNARY_BP, depth + 1);
         return { t: 'unary', op: t.value, operand: operand, pos: t.pos };
@@ -346,6 +366,53 @@
     },
     avg: function (a) { var list = arr(a, 'avg'); if (!list.length) return 0; return FUNCTIONS.sum(list) / list.length; },
     count: function (a) { return arr(a, 'count').length; },
+    /** Declarative row filter — no lambdas allowed in this language, so the comparison is fixed (strict-ish ==) and native. */
+    whereEquals: function (a, key, value) {
+      var k = str(key, 'whereEquals');
+      if (isDeniedKey(k)) throw ExpressionError('SECURITY', 'whereEquals() key `' + k + '` is forbidden');
+      return arr(a, 'whereEquals').filter(function (row) {
+        return row !== null && typeof row === 'object' && Object.prototype.hasOwnProperty.call(row, k) && row[k] === value;
+      });
+    },
+    /** [{key,total}] — sums valueKey per distinct groupKey. For CHART data / dashboards. */
+    groupBySum: function (a, groupKey, valueKey) {
+      var gk = str(groupKey, 'groupBySum');
+      var vk = str(valueKey, 'groupBySum');
+      if (isDeniedKey(gk) || isDeniedKey(vk)) throw ExpressionError('SECURITY', 'groupBySum() key is forbidden');
+      var order = [];
+      var totals = {};
+      arr(a, 'groupBySum').forEach(function (row) {
+        if (row === null || typeof row !== 'object') return;
+        var k = String(row[gk]);
+        if (!Object.prototype.hasOwnProperty.call(totals, k)) { totals[k] = 0; order.push(k); }
+        totals[k] += num(row[vk], 'groupBySum');
+      });
+      return order.map(function (k) { return { key: k, total: totals[k] }; });
+    },
+    /** [{key,count}] — counts rows per distinct groupKey. For CHART data / dashboards. */
+    groupByCount: function (a, groupKey) {
+      var gk = str(groupKey, 'groupByCount');
+      if (isDeniedKey(gk)) throw ExpressionError('SECURITY', 'groupByCount() key is forbidden');
+      var order = [];
+      var counts = {};
+      arr(a, 'groupByCount').forEach(function (row) {
+        if (row === null || typeof row !== 'object') return;
+        var k = String(row[gk]);
+        if (!Object.prototype.hasOwnProperty.call(counts, k)) { counts[k] = 0; order.push(k); }
+        counts[k] += 1;
+      });
+      return order.map(function (k) { return { key: k, count: counts[k] }; });
+    },
+    /** sum(row[keyA] * row[keyB]) across rows — e.g. cart total = sumProduct(state.cart, 'qty', 'harga'). */
+    sumProduct: function (a, keyA, keyB) {
+      var ka = str(keyA, 'sumProduct');
+      var kb = str(keyB, 'sumProduct');
+      if (isDeniedKey(ka) || isDeniedKey(kb)) throw ExpressionError('SECURITY', 'sumProduct() key is forbidden');
+      return arr(a, 'sumProduct').reduce(function (acc, row) {
+        if (row === null || typeof row !== 'object') return acc;
+        return acc + num(row[ka], 'sumProduct') * num(row[kb], 'sumProduct');
+      }, 0);
+    },
 
     // strings
     len: function (a) {
@@ -446,6 +513,12 @@
 
       case 'array':
         return node.items.map(function (item) { return self.run(item); });
+
+      case 'object': {
+        var obj = {};
+        node.pairs.forEach(function (pair) { obj[pair.key] = self.run(pair.value); });
+        return obj;
+      }
 
       case 'ident': {
         var name = node.name;
